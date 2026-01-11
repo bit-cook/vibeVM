@@ -42,8 +42,13 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: false
-    plain_text_passwd: password
 ssh_pwauth: true
+runcmd:
+  - mkdir -p /mnt/host
+  - mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host || true
+  - sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
+  - passwd -d user
+  - systemctl restart sshd
 EOF
 
   # Create cloud-init seed image
@@ -63,6 +68,8 @@ echo "Console login: user / password"
 echo "Quit: Ctrl-A X"
 echo ""
 
+
+sandbox-exec -p '(version 1) (allow default) (deny file-read* file-write* (subpath "/Users/dev/work/vibebox/target"))' \
 qemu-system-aarch64 \
   -M virt \
   -accel hvf \
@@ -76,4 +83,17 @@ qemu-system-aarch64 \
   -device virtio-net-pci,netdev=net0 \
   -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
   -nographic \
+  -fsdev local,id=host_dev,path=/Users/dev/work/vibebox,security_model=mapped-xattr \
+  -device virtio-9p-pci,fsdev=host_dev,mount_tag=hostshare \
   -serial mon:stdio
+  #-serial mon:stdio > /dev/null 2>&1 &
+
+#If you want to interact with the console later, consider `-serial unix:/tmp/qemu-serial.sock,server,nowait` instead, then connect with `socat - UNIX-CONNECT:/tmp/qemu-serial.sock` when needed.
+
+QEMU_PID=$!
+
+until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=1 -p 2222 user@localhost true 2>/dev/null; do
+  sleep 1
+done
+
+ssh -p 2222 user@localhost
