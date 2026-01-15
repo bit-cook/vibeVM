@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{
@@ -256,6 +255,7 @@ fn create_vm_configuration(
     (
         Retained<VZVirtualMachineConfiguration>,
         Option<thread::JoinHandle<()>>,
+        Option<thread::JoinHandle<()>>,
         RawFd,
     ),
     Box<dyn std::error::Error>,
@@ -313,15 +313,17 @@ fn create_vm_configuration(
         let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
         config.setDirectorySharingDevices(&share_devices);
 
-        let (ns_read_handle, ns_write_handle, inject_write_fd, tee_thread) =
+        let (serial_read_handle, serial_write_handle, inject_write_fd, tee_thread) =
             tee_console_to_log(&paths.console_log)?;
+        let stdin_forward_thread = start_stdin_forwarder(inject_write_fd);
 
-        // Single bidirectional serial port
+        // Single bidirectional serial port: guest reads from our pipe (which stdin + injector write),
+        // guest writes to our pipe (tee to log + stdout).
         let serial_attach =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
-                Some(&ns_read_handle),
-                Some(&ns_write_handle),
+                Some(&serial_read_handle),
+                Some(&serial_write_handle),
             );
         let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
         serial_port.setAttachment(Some(&serial_attach));
@@ -337,7 +339,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok((config, tee_thread, inject_write_fd))
+        Ok((config, tee_thread, stdin_forward_thread, inject_write_fd))
     }
 }
 
@@ -523,6 +525,8 @@ fn tee_console_to_log(
                 let _ = file.write_all(&buf[..n]);
                 let _ = file.flush();
             }
+            let _ = io::stdout().write_all(&buf[..n]);
+            let _ = io::stdout().flush();
         }
     });
 
@@ -532,6 +536,32 @@ fn tee_console_to_log(
         in_write_fd,
         Some(tee_thread),
     ))
+}
+
+fn start_stdin_forwarder(target_fd: RawFd) -> Option<thread::JoinHandle<()>> {
+    let dup_fd = unsafe { libc::dup(target_fd) };
+    if dup_fd < 0 {
+        eprintln!(
+            "Failed to dup target fd for stdin forward: {}",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    Some(thread::spawn(move || {
+        let mut input = io::stdin();
+        let mut out = unsafe { File::from_raw_fd(dup_fd) };
+        let mut buf = [0u8; 4096];
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    }))
 }
 
 fn create_disk_attachment(
@@ -591,6 +621,7 @@ fn run_vm(
     config: (
         Retained<VZVirtualMachineConfiguration>,
         Option<thread::JoinHandle<()>>,
+        Option<thread::JoinHandle<()>>,
         RawFd,
     ),
     provision: bool,
@@ -600,7 +631,7 @@ fn run_vm(
     println!("Starting VM with Apple Virtualization Framework...");
 
     let queue = DispatchQueue::main();
-    let (config, tee_handle, inject_fd) = config;
+    let (config, tee_handle, stdin_thread, inject_fd) = config;
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
     };
@@ -706,6 +737,9 @@ fn run_vm(
     if let Some(handle) = tee_handle {
         let _ = handle.join();
     }
+    if let Some(handle) = stdin_thread {
+        let _ = handle.join();
+    }
     Ok(())
 }
 
@@ -794,3 +828,140 @@ impl Drop for RawModeGuard {
         }
     }
 }
+
+// how can I have ctrl-c to go the guest vm rather than closing the entire vm and process?
+
+// You need to handle signals on the host side and forward them to the guest instead of letting them terminate your process.
+
+// Two approaches:
+
+// **1. Ignore SIGINT on host, let raw mode forward Ctrl-C as bytes**
+
+// Your raw mode setup already disables canonical mode, but you need to also disable signal generation from the terminal:
+
+// ```rust
+// fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
+//     let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+
+//     if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
+//         return Err(io::Error::last_os_error());
+//     }
+
+//     let original = attributes;
+
+//     attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
+//     attributes.c_lflag &= !((libc::ICANON | libc::ECHO | libc::ISIG) as libc::tcflag_t);
+
+//     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
+//         return Err(io::Error::last_os_error());
+//     }
+
+//     Ok(RawModeGuard { fd, original })
+// }
+// ```
+
+// Adding `libc::ISIG` to the mask disables SIGINT/SIGQUIT/SIGSUSP generation. Now Ctrl-C arrives as byte `0x03` which your stdin forwarder sends to the guest.
+
+// **2. Define an escape sequence to exit**
+
+// With ISIG disabled, you lose the ability to kill the host process via Ctrl-C. Common pattern: use an escape sequence like `~.` (tilde-dot, same as SSH):
+
+// ```rust
+// fn start_stdin_forwarder(target_fd: RawFd) -> Option<thread::JoinHandle<()>> {
+//     let dup_fd = unsafe { libc::dup(target_fd) };
+//     if dup_fd < 0 {
+//         eprintln!(
+//             "Failed to dup target fd for stdin forward: {}",
+//             io::Error::last_os_error()
+//         );
+//         return None;
+//     }
+//     Some(thread::spawn(move || {
+//         let mut input = io::stdin();
+//         let mut out = unsafe { File::from_raw_fd(dup_fd) };
+//         let mut buf = [0u8; 1];
+//         let mut last_was_newline = true;
+//         let mut last_was_tilde = false;
+
+//         loop {
+//             match input.read(&mut buf) {
+//                 Ok(0) => break,
+//                 Ok(1) => {
+//                     let byte = buf[0];
+
+//                     // Escape sequence: ~. after newline exits
+//                     if last_was_newline && byte == b'~' {
+//                         last_was_tilde = true;
+//                         last_was_newline = false;
+//                         continue; // Don't forward yet
+//                     }
+
+//                     if last_was_tilde {
+//                         if byte == b'.' {
+//                             eprintln!("\r\n[Connection closed]");
+//                             break; // Exit the forwarder, VM will continue but no input
+//                         }
+//                         // Not an escape, forward the delayed tilde
+//                         let _ = out.write_all(&[b'~']);
+//                         last_was_tilde = false;
+//                     }
+
+//                     last_was_newline = byte == b'\r' || byte == b'\n';
+//                     let _ = out.write_all(&buf);
+//                     let _ = out.flush();
+//                 }
+//                 Ok(_) => unreachable!(),
+//                 Err(_) => break,
+//             }
+//         }
+//     }))
+// }
+// ```
+
+// With this, type `~.` on a new line to disconnect from the console. Ctrl-C goes to guest.
+
+// should this provisioned vm have access to the internet? ping seems to hang without even timing out
+
+// Yes, it should. The VM is configured with `VZNATNetworkDeviceAttachment` which provides NAT networking through the host.
+
+// The hang without timeout suggests the network interface isn't coming up properly in the guest. Likely causes:
+
+// 1. **Missing network interface configuration** - Debian cloud images often expect cloud-init or DHCP to configure the interface, but with `nocloud` variant there's no cloud-init running.
+
+// 2. **Interface not brought up** - The virtio-net device is probably present but not configured.
+
+// Check inside the guest:
+
+// ```
+// ip link
+// ip addr
+// ```
+
+// You'll likely see an interface (probably `enp0s1` or similar) that's DOWN or has no IP.
+
+// Fix in your provision script - add early network setup:
+
+// ```
+// # Bring up network interface with DHCP
+// for iface in /sys/class/net/en*; do
+//     iface_name=$(basename "$iface")
+//     ip link set "$iface_name" up
+//     dhclient "$iface_name" || dhcpcd "$iface_name" || true
+// done
+// ```
+
+// Or more robustly, check if the image has `systemd-networkd`. You may need to create `/etc/systemd/network/80-dhcp.network`:
+
+// ```
+// [Match]
+// Name=en*
+
+// [Network]
+// DHCP=yes
+// ```
+
+// Then `systemctl enable --now systemd-networkd`.
+
+// The NAT attachment itself is fine - it's the guest-side configuration that's missing.
+
+// I don't have dhclient or dhcpcd!
