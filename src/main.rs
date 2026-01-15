@@ -53,8 +53,6 @@ struct VmPaths {
     efi_variable_store: PathBuf,
     cargo_registry: PathBuf,
     console_log: PathBuf,
-    origin_marker: PathBuf,
-    configured_marker: PathBuf,
 }
 
 impl VmPaths {
@@ -82,8 +80,6 @@ impl VmPaths {
         let efi_variable_store = instance_dir.join("efi-variable-store");
         let cargo_registry = home.join(".cargo/registry");
         let console_log = instance_dir.join("console.log");
-        let origin_marker = cache_dir.join("image.origin");
-        let configured_marker = cache_dir.join("configured_base.done");
 
         Ok(Self {
             project_root,
@@ -99,8 +95,6 @@ impl VmPaths {
             efi_variable_store,
             cargo_registry,
             console_log,
-            origin_marker,
-            configured_marker,
         })
     }
 }
@@ -128,16 +122,6 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    let expected_origin = DEBIAN_ORIGIN;
-
-    // If the cached image isn't marked as the expected distro, clear it.
-    let cached_origin = fs::read_to_string(&paths.origin_marker).unwrap_or_default();
-    if cached_origin.trim() != expected_origin {
-        fs::remove_file(&paths.downloaded_image).ok();
-        fs::remove_file(&paths.base_raw).ok();
-        println!("Resetting cached images for {}...", expected_origin);
-    }
-
     if paths.downloaded_image.exists() {
         println!(
             "Reusing cached base image at {}",
@@ -178,8 +162,6 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
-    fs::write(&paths.origin_marker, expected_origin)?;
-
     Ok(())
 }
 
@@ -213,19 +195,14 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
 
     validate_image(&paths.base_raw, "converted base raw")
         .then_some(())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "Converted base image failed validation",
-            )
-        })?;
+        .ok_or_else(|| io::Error::other("Converted base image failed validation"))?;
 
     resize_file(&paths.base_raw, DISK_SIZE_GB)?;
     Ok(())
 }
 
 fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.configured_base.exists() && paths.configured_marker.exists() {
+    if paths.configured_base.exists() {
         println!(
             "Using cached configured base at {}",
             paths.configured_base.display()
@@ -239,7 +216,7 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
 
     let config = create_vm_configuration(paths, &paths.configured_base)?;
     let _ = run_vm(config, true, paths, MountMode::SkipMounts)?;
-    fs::write(&paths.configured_marker, "ok")?;
+
     Ok(())
 }
 
@@ -619,7 +596,7 @@ fn run_vm(
         vm.startWithCompletionHandler(&completion_handler);
     }
 
-    let provision_thread = if provision && !paths.configured_marker.exists() {
+    let provision_thread = if provision {
         let script = format_provision_script(&paths.project_name);
         Some(start_script_thread(
             script,
@@ -690,7 +667,6 @@ fn run_vm(
     drop(raw_guard);
     if let Some(handle) = provision_thread {
         let _ = handle.join();
-        fs::write(&paths.configured_marker, "ok")?;
     }
     if let Some(handle) = mount_thread {
         let _ = handle.join();
