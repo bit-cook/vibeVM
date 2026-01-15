@@ -269,20 +269,31 @@ fn create_cloud_init_iso(paths: &VmPaths) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn cloud_init_user_data() -> String {
-    format!(
-        r#"#cloud-config
+    r#"#cloud-config
+datasource_list: [NoCloud, None]
+datasource:
+  NoCloud:
+    seedfrom: /dev/sr1
+network:
+  config: disabled
+bootcmd:
+  - systemctl mask systemd-networkd-wait-online.service
+  - systemctl mask systemd-time-wait-sync.service
+  - systemctl mask systemd-timesyncd.service
 users:
   - name: user
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: false
 ssh_pwauth: true
+disable_ec2_metadata: true
+manual_cache_clean: true
 runcmd:
   - sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
   - passwd -d user
   - systemctl restart sshd
-"#,
-    )
+"#
+    .to_string()
 }
 
 fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Error>> {
@@ -997,3 +1008,5 @@ impl Drop for RawModeGuard {
 // sudo mount -t virtiofs mise_cache .local/share/mise
 // curl https://mise.run | sh
 // echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+
+// vm only has network on first boot. when launching it again, there's no name resolution.
