@@ -13,11 +13,10 @@ use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::define_class;
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, ProtocolObject};
-use objc2::{msg_send, AnyThread};
+use objc2::AnyThread;
 use objc2_foundation::{
-    NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSObjectProtocol,
-    NSRunLoop, NSString, NSUInteger, NSURL,
+    NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSRunLoop, NSString,
+    NSUInteger, NSURL,
 };
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
@@ -27,7 +26,6 @@ use objc2_virtualization::{
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
-    VZVirtualMachineDelegate,
 };
 
 const DEBIAN_ORIGIN: &str = "debian-13-nocloud-arm64";
@@ -39,30 +37,6 @@ const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[name = "VibeboxVmDelegate"]
-    struct VmDelegate;
-
-    impl VmDelegate {
-        #[unsafe(method(guestDidStopVirtualMachine:))]
-        unsafe fn guest_did_stop_virtual_machine(&self, _vm: &VZVirtualMachine) {
-            println!("[delegate] guest stopped the VM");
-        }
-
-        #[unsafe(method(virtualMachine:didStopWithError:))]
-        unsafe fn vm_did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
-            println!(
-                "[delegate] VM stopped with error: {:?}",
-                error.localizedDescription()
-            );
-        }
-    }
-
-    unsafe impl NSObjectProtocol for VmDelegate {}
-    unsafe impl VZVirtualMachineDelegate for VmDelegate {}
-);
 
 #[derive(Debug)]
 struct VmPaths {
@@ -621,14 +595,6 @@ fn run_vm(
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
     };
-
-    let delegate: Retained<ProtocolObject<dyn VZVirtualMachineDelegate>> = unsafe {
-        let del: Retained<VmDelegate> = msg_send![VmDelegate::alloc(), init];
-        ProtocolObject::from_retained(del)
-    };
-    unsafe {
-        vm.setDelegate(Some(&delegate));
-    }
 
     let initial_state = unsafe { vm.state() };
     println!(
