@@ -20,33 +20,21 @@ use objc2_foundation::{
 };
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
+    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
     VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
-    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineDelegate,
 };
 
-const UBUNTU_SERIES: &str = "noble";
-const UBUNTU_VERSION: &str = "24.04";
-const UBUNTU_ARCH: &str = "arm64";
-const UBUNTU_ORIGIN: &str = "ubuntu-24.04-arm64";
-const UBUNTU_KERNEL_URL: &str = "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic";
-const UBUNTU_INITRD_URL: &str = "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-initrd-generic";
-const UBUNTU_DISK_URL: &str =
-    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img";
+const DEBIAN_ORIGIN: &str = "debian-13-nocloud-arm64";
+const DEBIAN_DISK_URL: &str =
+    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.qcow2";
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const CLOUD_INIT_ISO: &str = "cloud-init.iso";
-const CLOUD_INIT_LABEL: &str = "cidata";
-const KERNEL_NAME: &str = "vmlinux-ubuntu";
-const INITRD_NAME: &str = "initrd-ubuntu";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
-const VIRTIOFS_MOUNT_SERVICE: &str = "vibebox-mounts.service";
-const ROOT_LABEL: &str = "cloudimg-rootfs";
-const ROOT_FS_TYPE: &str = "ext4";
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -77,16 +65,12 @@ struct VmPaths {
     project_root: PathBuf,
     project_name: String,
     cache_dir: PathBuf,
-    guest_mise_cache: PathBuf,
     instance_dir: PathBuf,
     downloaded_image: PathBuf,
     base_raw: PathBuf,
     instance_disk: PathBuf,
-    cloud_init_iso: PathBuf,
     machine_identifier: PathBuf,
-    kernel_path: PathBuf,
-    initrd_path: PathBuf,
-    cargo_registry: PathBuf,
+    efi_variable_store: PathBuf,
     console_log: PathBuf,
     origin_marker: PathBuf,
 }
@@ -105,18 +89,13 @@ impl VmPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.join(".cache"));
         let cache_dir = cache_home.join("vibetron");
-        let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-
         let instance_dir = project_root.join(".vibetron");
 
         let downloaded_image = cache_dir.join("downloaded.qcow2");
         let base_raw = cache_dir.join("base.raw");
         let instance_disk = instance_dir.join("instance.raw");
-        let cloud_init_iso = instance_dir.join(CLOUD_INIT_ISO);
         let machine_identifier = instance_dir.join("machine.id");
-        let kernel_path = cache_dir.join(KERNEL_NAME);
-        let initrd_path = cache_dir.join(INITRD_NAME);
-        let cargo_registry = home.join(".cargo/registry");
+        let efi_variable_store = instance_dir.join("efi-variable-store");
         let console_log = instance_dir.join("console.log");
         let origin_marker = cache_dir.join("image.origin");
 
@@ -124,16 +103,12 @@ impl VmPaths {
             project_root,
             project_name,
             cache_dir,
-            guest_mise_cache,
             instance_dir,
             downloaded_image,
             base_raw,
             instance_disk,
-            cloud_init_iso,
             machine_identifier,
-            kernel_path,
-            initrd_path,
-            cargo_registry,
+            efi_variable_store,
             console_log,
             origin_marker,
         })
@@ -147,8 +122,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     download_base_image(&paths)?;
     convert_to_raw(&paths)?;
     ensure_instance_disk(&paths)?;
-    create_cloud_init_iso(&paths)?;
-    download_kernel_and_initrd(&paths)?;
     create_console_log(&paths)?;
 
     let config = create_vm_configuration(&paths)?;
@@ -157,22 +130,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&paths.cache_dir)?;
-    fs::create_dir_all(&paths.guest_mise_cache)?;
     fs::create_dir_all(&paths.instance_dir)?;
-    fs::create_dir_all(&paths.cargo_registry)?;
     Ok(())
 }
 
 fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    let expected_origin = UBUNTU_ORIGIN;
+    let expected_origin = DEBIAN_ORIGIN;
 
     // If the cached image isn't marked as the expected distro, clear it.
     let cached_origin = fs::read_to_string(&paths.origin_marker).unwrap_or_default();
     if cached_origin.trim() != expected_origin {
         fs::remove_file(&paths.downloaded_image).ok();
         fs::remove_file(&paths.base_raw).ok();
-        fs::remove_file(&paths.kernel_path).ok();
-        fs::remove_file(&paths.initrd_path).ok();
         println!("Resetting cached images for {}...", expected_origin);
     }
 
@@ -182,12 +151,12 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
             paths.downloaded_image.display()
         );
     } else {
-        println!("Downloading Ubuntu cloud image...");
+        println!("Downloading Debian cloud image...");
         let status = Command::new("curl")
             .args([
                 "-L",
                 "-f",
-                UBUNTU_DISK_URL,
+                DEBIAN_DISK_URL,
                 "-o",
                 paths.downloaded_image.to_string_lossy().as_ref(),
             ])
@@ -205,7 +174,7 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
             .args([
                 "-L",
                 "-f",
-                UBUNTU_DISK_URL,
+                DEBIAN_DISK_URL,
                 "-o",
                 paths.downloaded_image.to_string_lossy().as_ref(),
             ])
@@ -281,164 +250,6 @@ fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn create_cloud_init_iso(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Building cloud-init ISO...");
-    let data_dir = paths.instance_dir.join("cloud-init-data");
-    if data_dir.exists() {
-        fs::remove_dir_all(&data_dir)?;
-    }
-    fs::create_dir_all(&data_dir)?;
-
-    let meta_data = format!(
-        "instance-id: {}\nlocal-hostname: {}\n",
-        paths.project_name, paths.project_name
-    );
-    let user_data = cloud_init_user_data(&paths.project_name);
-
-    fs::write(data_dir.join("meta-data"), meta_data)?;
-    fs::write(data_dir.join("user-data"), user_data)?;
-
-    if paths.cloud_init_iso.exists() {
-        fs::remove_file(&paths.cloud_init_iso)?;
-    }
-
-    let status = Command::new("hdiutil")
-        .args([
-            "makehybrid",
-            "-o",
-            paths.cloud_init_iso.to_string_lossy().as_ref(),
-            "-iso",
-            "-joliet",
-            "-default-volume-name",
-            CLOUD_INIT_LABEL,
-            data_dir.to_string_lossy().as_ref(),
-        ])
-        .status()?;
-
-    fs::remove_dir_all(&data_dir)?;
-
-    if !status.success() {
-        return Err("Failed to build cloud-init ISO".into());
-    }
-
-    Ok(())
-}
-
-fn download_kernel_and_initrd(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.kernel_path.exists() && paths.initrd_path.exists() {
-        println!(
-            "Reusing cached kernel/initrd at {} and {}",
-            paths.kernel_path.display(),
-            paths.initrd_path.display()
-        );
-        return Ok(());
-    }
-
-    let kernel_tmp = paths.kernel_path.with_extension("gz");
-
-    println!("Downloading Ubuntu kernel (compressed)...");
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "-f",
-            UBUNTU_KERNEL_URL,
-            "-o",
-            kernel_tmp.to_string_lossy().as_ref(),
-        ])
-        .status()?;
-    if !status.success() {
-        return Err("Failed to download Ubuntu kernel".into());
-    }
-
-    println!("Decompressing kernel to {}", paths.kernel_path.display());
-    let status = Command::new("gunzip")
-        .args(["-f", "-c", kernel_tmp.to_string_lossy().as_ref()])
-        .stdout(fs::File::create(&paths.kernel_path)?)
-        .status()?;
-    fs::remove_file(&kernel_tmp).ok();
-    if !status.success() {
-        return Err("Failed to decompress Ubuntu kernel".into());
-    }
-
-    println!("Downloading Ubuntu initrd...");
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            "-f",
-            UBUNTU_INITRD_URL,
-            "-o",
-            paths.initrd_path.to_string_lossy().as_ref(),
-        ])
-        .status()?;
-    if !status.success() {
-        return Err("Failed to download Ubuntu initrd".into());
-    }
-
-    Ok(())
-}
-
-fn cloud_init_user_data(project_name: &str) -> String {
-    format!(
-        r#"#cloud-config
-users:
-  - name: user
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: false
-ssh_pwauth: true
-
-write_files:
-  - path: /etc/systemd/system/{mount_service}
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Mount host shares for vibebox
-      After=network-online.target systemd-modules-load.service
-      Wants=network-online.target
-      ConditionVirtualization=yes
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/bin/mkdir -p /home/user/.cargo/registry /home/user/.local/share/mise /home/user/{project_name} /home/user/.config/mise
-      ExecStart=/bin/mount -t virtiofs cargo_registry /home/user/.cargo/registry
-      ExecStart=/bin/mount -t virtiofs mise_cache /home/user/.local/share/mise
-      ExecStart=/bin/mount -t virtiofs current_dir /home/user/{project_name}
-      ExecStart=/bin/chown -R user:user /home/user/.cargo /home/user/.local/share/mise /home/user/{project_name}
-      RemainAfterExit=yes
-
-      [Install]
-      WantedBy=multi-user.target
-  - path: /home/user/.config/mise/config.toml
-    permissions: '0644'
-    owner: user:user
-    content: |
-      [settings]
-      python.uv_venv_auto = true
-      experimental = true
-      idiomatic_version_file_enable_tools = ["rust"]
-
-      [tools]
-      uv = "0.9.25"
-      node = "24.13.0"
-      "npm:@openai/codex" = "latest"
-
-runcmd:
-  - systemctl enable --now serial-getty@hvc0.service
-  - systemctl enable --now {mount_service}
-  - apt-get update
-  - apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev curl git ripgrep ca-certificates
-  - curl https://mise.run | sh
-  - echo 'eval \"$(/home/user/.local/bin/mise activate bash)\"' >> /home/user/.bashrc
-  - touch /etc/cloud/cloud-init.disabled
-  - systemctl disable apt-daily.timer apt-daily-upgrade.timer man-db.timer e2scrub_all.timer fstrim.timer unattended-upgrades || true
-  - systemctl mask systemd-timesyncd || true
-  - systemctl mask apparmor || true
-"#,
-        project_name = project_name,
-        mount_service = VIRTIOFS_MOUNT_SERVICE
-    )
-}
-
 fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     // Fresh log each run so users can tail for console output.
     fs::OpenOptions::new()
@@ -458,16 +269,9 @@ fn create_vm_configuration(
         let machine_id = load_machine_identifier(paths)?;
         platform.setMachineIdentifier(&machine_id);
 
-        let kernel_url = nsurl_from_path(&paths.kernel_path)?;
-        let boot_loader =
-            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
-        let initrd_url = nsurl_from_path(&paths.initrd_path)?;
-        boot_loader.setInitialRamdiskURL(Some(&initrd_url));
-        let cmdline = NSString::from_str(&format!(
-            "console=hvc0 root=LABEL={} rootfstype={} ro rootwait loglevel=7 systemd.log_level=debug",
-            ROOT_LABEL, ROOT_FS_TYPE
-        ));
-        boot_loader.setCommandLine(&cmdline);
+        let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
+        let variable_store = load_efi_variable_store(paths)?;
+        boot_loader.setVariableStore(Some(&variable_store));
 
         let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
@@ -481,16 +285,8 @@ fn create_vm_configuration(
             &disk_attachment,
         );
 
-        let cloud_init_attachment = create_disk_attachment(&paths.cloud_init_iso, true)?;
-        let cloud_init_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-            VZVirtioBlockDeviceConfiguration::alloc(),
-            &cloud_init_attachment,
-        );
-
-        let storage_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-            Retained::into_super(disk_device),
-            Retained::into_super(cloud_init_device),
-        ]);
+        let storage_devices: Retained<NSArray<_>> =
+            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
         config.setStorageDevices(&storage_devices);
 
         let nat_attachment = VZNATNetworkDeviceAttachment::new();
@@ -504,21 +300,6 @@ fn create_vm_configuration(
         let entropy_devices: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(entropy_device)]);
         config.setEntropyDevices(&entropy_devices);
-
-        let directory_shares = [
-            ("cargo_registry", &paths.cargo_registry, true),
-            ("mise_cache", &paths.guest_mise_cache, false),
-            ("current_dir", &paths.project_root, false),
-        ];
-
-        let mut share_devices: Vec<Retained<_>> = Vec::new();
-        for (tag, path, read_only) in directory_shares {
-            let device = create_directory_share(tag, path, read_only)?;
-            share_devices.push(Retained::into_super(device));
-        }
-
-        let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
-        config.setDirectorySharingDevices(&share_devices);
 
         let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
         let stdout_handle = NSFileHandle::fileHandleWithStandardOutput();
@@ -594,6 +375,31 @@ fn load_machine_identifier(
     }
 }
 
+fn load_efi_variable_store(
+    paths: &VmPaths,
+) -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
+    unsafe {
+        let url = nsurl_from_path(&paths.efi_variable_store)?;
+        let options = VZEFIVariableStoreInitializationOptions::AllowOverwrite;
+        let store = VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+            VZEFIVariableStore::alloc(),
+            &url,
+            options,
+        )
+        .map_err(|e| {
+            Box::<dyn std::error::Error>::from(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Failed to create EFI variable store at {}: {:?}",
+                    paths.efi_variable_store.display(),
+                    e.localizedDescription()
+                ),
+            ))
+        })?;
+        Ok(store)
+    }
+}
+
 fn create_disk_attachment(
     path: &Path,
     read_only: bool,
@@ -608,37 +414,6 @@ fn create_disk_attachment(
             VZDiskImageSynchronizationMode::Full,
         )
         .map_err(|e| format!("Failed to attach disk {}: {:?}", path.display(), e).into())
-    }
-}
-
-fn create_directory_share(
-    tag: &str,
-    path: &Path,
-    read_only: bool,
-) -> Result<Retained<VZVirtioFileSystemDeviceConfiguration>, Box<dyn std::error::Error>> {
-    unsafe {
-        let ns_tag = NSString::from_str(tag);
-        VZVirtioFileSystemDeviceConfiguration::validateTag_error(&ns_tag).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid virtiofs tag {}: {:?}", tag, e),
-            )
-        })?;
-
-        let url = nsurl_from_path(path)?;
-        let shared_directory =
-            VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url, read_only);
-        let single_share = VZSingleDirectoryShare::initWithDirectory(
-            VZSingleDirectoryShare::alloc(),
-            &shared_directory,
-        );
-
-        let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-            VZVirtioFileSystemDeviceConfiguration::alloc(),
-            &ns_tag,
-        );
-        device.setShare(Some(&single_share));
-        Ok(device)
     }
 }
 
