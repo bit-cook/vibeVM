@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -22,25 +22,31 @@ use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
     VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceConfiguration,
-    VZVirtioConsolePortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineDelegate,
 };
 
-const DOWNLOAD_URL: &str =
-    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2";
+const UBUNTU_SERIES: &str = "noble";
+const UBUNTU_VERSION: &str = "24.04";
+const UBUNTU_ARCH: &str = "arm64";
+const UBUNTU_ORIGIN: &str = "ubuntu-24.04-arm64";
+const UBUNTU_KERNEL_URL: &str = "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic";
+const UBUNTU_INITRD_URL: &str = "https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-initrd-generic";
+const UBUNTU_DISK_URL: &str =
+    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img";
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CLOUD_INIT_ISO: &str = "cloud-init.iso";
 const CLOUD_INIT_LABEL: &str = "cidata";
-const KERNEL_URL: &str = "https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux";
-const INITRD_URL: &str = "https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/initrd.gz";
-const KERNEL_NAME: &str = "vmlinux-debian";
-const INITRD_NAME: &str = "initrd-debian";
+const KERNEL_NAME: &str = "vmlinux-ubuntu";
+const INITRD_NAME: &str = "initrd-ubuntu";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const VIRTIOFS_MOUNT_SERVICE: &str = "vibebox-mounts.service";
+const ROOT_LABEL: &str = "cloudimg-rootfs";
+const ROOT_FS_TYPE: &str = "ext4";
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -81,6 +87,8 @@ struct VmPaths {
     kernel_path: PathBuf,
     initrd_path: PathBuf,
     cargo_registry: PathBuf,
+    console_log: PathBuf,
+    origin_marker: PathBuf,
 }
 
 impl VmPaths {
@@ -109,6 +117,8 @@ impl VmPaths {
         let kernel_path = cache_dir.join(KERNEL_NAME);
         let initrd_path = cache_dir.join(INITRD_NAME);
         let cargo_registry = home.join(".cargo/registry");
+        let console_log = instance_dir.join("console.log");
+        let origin_marker = cache_dir.join("image.origin");
 
         Ok(Self {
             project_root,
@@ -124,6 +134,8 @@ impl VmPaths {
             kernel_path,
             initrd_path,
             cargo_registry,
+            console_log,
+            origin_marker,
         })
     }
 }
@@ -137,6 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_instance_disk(&paths)?;
     create_cloud_init_iso(&paths)?;
     download_kernel_and_initrd(&paths)?;
+    create_console_log(&paths)?;
 
     let config = create_vm_configuration(&paths)?;
     run_vm(config)
@@ -151,41 +164,77 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_origin = UBUNTU_ORIGIN;
+
+    // If the cached image isn't marked as the expected distro, clear it.
+    let cached_origin = fs::read_to_string(&paths.origin_marker).unwrap_or_default();
+    if cached_origin.trim() != expected_origin {
+        fs::remove_file(&paths.downloaded_image).ok();
+        fs::remove_file(&paths.base_raw).ok();
+        fs::remove_file(&paths.kernel_path).ok();
+        fs::remove_file(&paths.initrd_path).ok();
+        println!("Resetting cached images for {}...", expected_origin);
+    }
+
     if paths.downloaded_image.exists() {
         println!(
-            "Reusing cached Debian image at {}",
+            "Reusing cached base image at {}",
             paths.downloaded_image.display()
         );
-        return Ok(());
+    } else {
+        println!("Downloading Ubuntu cloud image...");
+        let status = Command::new("curl")
+            .args([
+                "-L",
+                "-f",
+                UBUNTU_DISK_URL,
+                "-o",
+                paths.downloaded_image.to_string_lossy().as_ref(),
+            ])
+            .status()?;
+
+        if !status.success() {
+            return Err("Failed to download Ubuntu cloud image".into());
+        }
     }
 
-    println!("Downloading Debian cloud image...");
-    let status = Command::new("curl")
-        .args([
-            "-L",
-            DOWNLOAD_URL,
-            "-o",
-            paths.downloaded_image.to_string_lossy().as_ref(),
-        ])
-        .status()?;
+    if !validate_image(&paths.downloaded_image, "cached base image") {
+        println!("Cached base image invalid, redownloading...");
+        fs::remove_file(&paths.downloaded_image).ok();
+        let status = Command::new("curl")
+            .args([
+                "-L",
+                "-f",
+                UBUNTU_DISK_URL,
+                "-o",
+                paths.downloaded_image.to_string_lossy().as_ref(),
+            ])
+            .status()?;
 
-    if !status.success() {
-        return Err("Failed to download Debian cloud image".into());
+        if !status.success() {
+            return Err("Failed to download Ubuntu cloud image".into());
+        }
     }
+
+    fs::write(&paths.origin_marker, expected_origin)?;
 
     Ok(())
 }
 
 fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.base_raw.exists() {
-        println!(
-            "Reusing converted base image at {}",
-            paths.base_raw.display()
-        );
-        return Ok(());
+        if validate_image(&paths.base_raw, "cached base raw") {
+            println!(
+                "Reusing converted base image at {}",
+                paths.base_raw.display()
+            );
+            return Ok(());
+        }
+        println!("Cached base image invalid, regenerating...");
+        fs::remove_file(&paths.base_raw).ok();
     }
 
-    println!("Converting qcow2 image to raw...");
+    println!("Converting source image to raw...");
     let status = Command::new("qemu-img")
         .args([
             "convert",
@@ -200,17 +249,30 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Failed to convert qcow2 image to raw".into());
     }
 
+    validate_image(&paths.base_raw, "converted base raw")
+        .then_some(())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "Converted base image failed validation",
+            )
+        })?;
+
     resize_file(&paths.base_raw, DISK_SIZE_GB)?;
     Ok(())
 }
 
 fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.instance_disk.exists() {
-        println!(
-            "Using existing instance disk at {}",
-            paths.instance_disk.display()
-        );
-        return Ok(());
+        if validate_image(&paths.instance_disk, "instance raw") {
+            println!(
+                "Using existing instance disk at {}",
+                paths.instance_disk.display()
+            );
+            return Ok(());
+        }
+        println!("Instance disk invalid, recreating...");
+        fs::remove_file(&paths.instance_disk).ok();
     }
 
     println!("Creating instance disk from cached base image...");
@@ -272,34 +334,44 @@ fn download_kernel_and_initrd(paths: &VmPaths) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
 
-    println!("Downloading netboot kernel...");
+    let kernel_tmp = paths.kernel_path.with_extension("gz");
+
+    println!("Downloading Ubuntu kernel (compressed)...");
     let status = Command::new("curl")
         .args([
             "-L",
-            KERNEL_URL,
+            "-f",
+            UBUNTU_KERNEL_URL,
             "-o",
-            paths.kernel_path.to_string_lossy().as_ref(),
+            kernel_tmp.to_string_lossy().as_ref(),
         ])
         .status()?;
     if !status.success() {
-        return Err("Failed to download kernel".into());
+        return Err("Failed to download Ubuntu kernel".into());
     }
 
-    let initrd_gz = paths.initrd_path.with_extension("gz");
-    println!("Downloading netboot initrd.gz...");
-    let status = Command::new("curl")
-        .args(["-L", INITRD_URL, "-o", initrd_gz.to_string_lossy().as_ref()])
-        .status()?;
-    if !status.success() {
-        return Err("Failed to download initrd.gz".into());
-    }
-
-    println!("Decompressing initrd...");
+    println!("Decompressing kernel to {}", paths.kernel_path.display());
     let status = Command::new("gunzip")
-        .args(["-f", initrd_gz.to_string_lossy().as_ref()])
+        .args(["-f", "-c", kernel_tmp.to_string_lossy().as_ref()])
+        .stdout(fs::File::create(&paths.kernel_path)?)
+        .status()?;
+    fs::remove_file(&kernel_tmp).ok();
+    if !status.success() {
+        return Err("Failed to decompress Ubuntu kernel".into());
+    }
+
+    println!("Downloading Ubuntu initrd...");
+    let status = Command::new("curl")
+        .args([
+            "-L",
+            "-f",
+            UBUNTU_INITRD_URL,
+            "-o",
+            paths.initrd_path.to_string_lossy().as_ref(),
+        ])
         .status()?;
     if !status.success() {
-        return Err("Failed to decompress initrd".into());
+        return Err("Failed to download Ubuntu initrd".into());
     }
 
     Ok(())
@@ -367,6 +439,16 @@ runcmd:
     )
 }
 
+fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    // Fresh log each run so users can tail for console output.
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.console_log)?;
+    Ok(())
+}
+
 fn create_vm_configuration(
     paths: &VmPaths,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
@@ -381,7 +463,10 @@ fn create_vm_configuration(
             VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
         let initrd_url = nsurl_from_path(&paths.initrd_path)?;
         boot_loader.setInitialRamdiskURL(Some(&initrd_url));
-        let cmdline = NSString::from_str("console=hvc0 root=LABEL=cloudimg-rootfs rw");
+        let cmdline = NSString::from_str(&format!(
+            "console=hvc0 root=LABEL={} rootfstype={} ro rootwait loglevel=7 systemd.log_level=debug",
+            ROOT_LABEL, ROOT_FS_TYPE
+        ));
         boot_loader.setCommandLine(&cmdline);
 
         let config = VZVirtualMachineConfiguration::new();
@@ -437,24 +522,39 @@ fn create_vm_configuration(
 
         let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
         let stdout_handle = NSFileHandle::fileHandleWithStandardOutput();
-        let serial_attachment =
+        let log_ns_path = NSString::from_str(
+            paths
+                .console_log
+                .to_str()
+                .ok_or("Non-UTF8 console log path")?,
+        );
+        let log_handle = NSFileHandle::fileHandleForWritingAtPath(&log_ns_path)
+            .ok_or("Failed to open console log file handle")?;
+
+        // First virtio console goes to the interactive terminal; second mirrors to a log file.
+        let serial_attachment_stdout =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
                 Some(&stdin_handle),
                 Some(&stdout_handle),
             );
+        let serial_console_stdout = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial_console_stdout.setAttachment(Some(&serial_attachment_stdout));
 
-        let console_device = VZVirtioConsoleDeviceConfiguration::new();
-        let console_ports = console_device.ports();
+        let serial_attachment_log =
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&log_handle),
+            );
+        let serial_console_log = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial_console_log.setAttachment(Some(&serial_attachment_log));
 
-        let console_port = VZVirtioConsolePortConfiguration::new();
-        console_port.setAttachment(Some(&serial_attachment));
-        console_port.setIsConsole(true);
-        console_ports.setObject_atIndexedSubscript(Some(&console_port), 0 as NSUInteger);
-
-        let console_devices: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(console_device)]);
-        config.setConsoleDevices(&console_devices);
+        let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+            Retained::into_super(serial_console_stdout),
+            Retained::into_super(serial_console_log),
+        ]);
+        config.setSerialPorts(&serial_ports);
 
         config.validateWithError().map_err(|e| {
             io::Error::new(
@@ -654,6 +754,39 @@ fn resize_file(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Erro
     let file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(size_bytes)?;
     Ok(())
+}
+
+fn validate_image(path: &Path, label: &str) -> bool {
+    if is_probably_html(path) {
+        eprintln!(
+            "Validation failed for {} at {} (looks like HTML)",
+            label,
+            path.display()
+        );
+        return false;
+    }
+    let output = Command::new("qemu-img")
+        .args(["info", path.to_string_lossy().as_ref()])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => true,
+        _ => {
+            eprintln!("Validation failed for {} at {}", label, path.display());
+            false
+        }
+    }
+}
+
+fn is_probably_html(path: &Path) -> bool {
+    if let Ok(mut file) = fs::File::open(path) {
+        let mut buf = [0u8; 256];
+        if let Ok(read) = file.read(&mut buf) {
+            let snippet = &buf[..read];
+            let lower = String::from_utf8_lossy(snippet).to_ascii_lowercase();
+            return lower.contains("<html") || lower.contains("<!doctype");
+        }
+    }
+    false
 }
 
 fn clone_sparse(src: &Path, dst: &Path) -> io::Result<()> {
