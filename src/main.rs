@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -14,7 +14,7 @@ use dispatch2::DispatchQueue;
 use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
-use objc2::{AnyThread, msg_send};
+use objc2::{msg_send, AnyThread};
 use objc2_foundation::{
     NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSObjectProtocol,
     NSRunLoop, NSString, NSUInteger, NSURL,
@@ -305,6 +305,7 @@ fn create_vm_configuration(
     (
         Retained<VZVirtualMachineConfiguration>,
         Option<thread::JoinHandle<()>>,
+        RawFd,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -362,7 +363,7 @@ fn create_vm_configuration(
         config.setDirectorySharingDevices(&share_devices);
 
         let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
-        let (console_write_handle, tee_thread) = tee_console_to_log(&paths.console_log)?;
+        let (console_write_handle, tee_thread, inject_fd) = tee_console_to_log(&paths.console_log)?;
 
         let serial_attachment =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
@@ -384,7 +385,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok((config, tee_thread))
+        Ok((config, tee_thread, inject_fd))
     }
 }
 
@@ -440,22 +441,33 @@ fn load_efi_variable_store(
     }
 }
 
-fn start_script_thread(script: String, log_path: PathBuf) -> thread::JoinHandle<()> {
+fn start_script_thread(
+    script: String,
+    log_path: PathBuf,
+    inject_fd: RawFd,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Wait for getty/login prompt to appear, then log in and run the script.
         if !wait_for_login(&log_path) {
             eprintln!("Timed out waiting for login prompt; skipping injected script");
             return;
         }
-        if let Ok(mut stdin) = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/stdin")
-        {
-            let payload = format!(
-                "\nroot\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
-                script = script
-            );
-            let _ = stdin.write_all(payload.as_bytes());
+
+        let payload = format!(
+            "\nroot\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+        );
+
+        // Duplicate the write fd so we don't close the one held by the serial port.
+        unsafe {
+            let dup_fd = libc::dup(inject_fd);
+            if dup_fd < 0 {
+                eprintln!("Failed to dup inject fd: {}", io::Error::last_os_error());
+                return;
+            }
+            let mut stdin = File::from_raw_fd(dup_fd);
+            if let Err(e) = stdin.write_all(payload.as_bytes()) {
+                eprintln!("Failed to write payload to VM serial: {}", e);
+            }
             let _ = stdin.flush();
         }
     })
@@ -488,7 +500,6 @@ mount -t virtiofs cargo_registry /home/vibe/.cargo/registry || true
 mount -t virtiofs mise_cache /home/vibe/.local/share/mise || true
 mount -t virtiofs current_dir /home/vibe/{project} || true
 chown -R vibe:vibe /home/vibe/.cargo /home/vibe/.local/share/mise /home/vibe/{project} || true
-exit
 "#,
         project = paths.project_name
     )
@@ -496,8 +507,14 @@ exit
 
 fn tee_console_to_log(
     log_path: &Path,
-) -> Result<(Retained<NSFileHandle>, Option<thread::JoinHandle<()>>), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        Retained<NSFileHandle>,
+        Option<thread::JoinHandle<()>>,
+        RawFd,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut fds = [0; 2];
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if rc != 0 {
@@ -513,7 +530,6 @@ fn tee_console_to_log(
     let log_path = log_path.to_path_buf();
     let tee_thread = thread::spawn(move || {
         let mut reader = unsafe { File::from_raw_fd(read_fd) };
-        let mut stdout = io::stdout();
         let mut log = OpenOptions::new()
             .create(true)
             .write(true)
@@ -525,8 +541,6 @@ fn tee_console_to_log(
             if n == 0 {
                 break;
             }
-            let _ = stdout.write_all(&buf[..n]);
-            let _ = stdout.flush();
             if let Some(file) = log.as_mut() {
                 let _ = file.write_all(&buf[..n]);
                 let _ = file.flush();
@@ -534,7 +548,7 @@ fn tee_console_to_log(
         }
     });
 
-    Ok((ns_write_handle, Some(tee_thread)))
+    Ok((ns_write_handle, Some(tee_thread), write_fd))
 }
 
 fn create_disk_attachment(
@@ -591,7 +605,11 @@ enum MountMode {
 }
 
 fn run_vm(
-    config: (Retained<VZVirtualMachineConfiguration>, Option<thread::JoinHandle<()>>),
+    config: (
+        Retained<VZVirtualMachineConfiguration>,
+        Option<thread::JoinHandle<()>>,
+        RawFd,
+    ),
     provision: bool,
     paths: &VmPaths,
     mount_mode: MountMode,
@@ -599,7 +617,7 @@ fn run_vm(
     println!("Starting VM with Apple Virtualization Framework...");
 
     let queue = DispatchQueue::main();
-    let (config, tee_handle) = config;
+    let (config, tee_handle, inject_fd) = config;
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
     };
@@ -637,7 +655,11 @@ fn run_vm(
 
     let provision_thread = if provision && !paths.configured_marker.exists() {
         let script = format_provision_script(&paths.project_name);
-        Some(start_script_thread(script, paths.console_log.clone()))
+        Some(start_script_thread(
+            script,
+            paths.console_log.clone(),
+            inject_fd,
+        ))
     } else {
         None
     };
@@ -647,6 +669,7 @@ fn run_vm(
         MountMode::MountAndChown => Some(start_script_thread(
             format_mount_script(paths),
             paths.console_log.clone(),
+            inject_fd,
         )),
     };
 
@@ -734,14 +757,6 @@ fn resize_file(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn validate_image(path: &Path, label: &str) -> bool {
-    if is_probably_html(path) {
-        eprintln!(
-            "Validation failed for {} at {} (looks like HTML)",
-            label,
-            path.display()
-        );
-        return false;
-    }
     let output = Command::new("qemu-img")
         .args(["info", path.to_string_lossy().as_ref()])
         .output();
@@ -752,18 +767,6 @@ fn validate_image(path: &Path, label: &str) -> bool {
             false
         }
     }
-}
-
-fn is_probably_html(path: &Path) -> bool {
-    if let Ok(mut file) = fs::File::open(path) {
-        let mut buf = [0u8; 256];
-        if let Ok(read) = file.read(&mut buf) {
-            let snippet = &buf[..read];
-            let lower = String::from_utf8_lossy(snippet).to_ascii_lowercase();
-            return lower.contains("<html") || lower.contains("<!doctype");
-        }
-    }
-    false
 }
 
 fn clone_sparse(src: &Path, dst: &Path) -> io::Result<()> {
