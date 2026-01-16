@@ -7,6 +7,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -144,6 +145,7 @@ struct SerialContext {
     stdout_thread: thread::JoinHandle<()>,
     writer_thread: thread::JoinHandle<()>,
     stdin_thread: thread::JoinHandle<()>,
+    running: Arc<AtomicBool>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -419,9 +421,7 @@ fn start_script_thread(
             return;
         }
         let path = "provisioning_script.sh";
-        do_write(&format!(
-            "cat >{path} <<'EOF'\n{script}EOF\nchmod +x {path}\n{path}\n"
-        ));
+        do_write(&format!("cat >{path} <<'EOF'\n{script}EOF\nsh {path}\n"));
     })
 }
 
@@ -442,23 +442,33 @@ fn setup_serial_pipes() -> Result<
     let (from_guest_vm, from_guest_host) = UnixStream::pair()?;
 
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    let running = Arc::new(AtomicBool::new(true));
+    let writer_running = Arc::clone(&running);
     let writer_thread = thread::spawn(move || {
         let mut writer = to_guest_host;
-        for chunk in input_rx {
-            if writer.write_all(&chunk).is_err() {
-                break;
+        while writer_running.load(Ordering::Relaxed) {
+            match input_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(chunk) => {
+                    if writer.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            let _ = writer.flush();
         }
     });
 
     let output_monitor = Arc::new(OutputMonitor::new());
     let output_monitor_clone = Arc::clone(&output_monitor);
+    let stdout_running = Arc::clone(&running);
     let stdout_thread = thread::spawn(move || {
         let mut stdout = io::stdout();
         let mut reader = from_guest_host;
         let mut buf = [0u8; 4096];
-        loop {
+        let _ = reader.set_read_timeout(Some(Duration::from_millis(20)));
+        while stdout_running.load(Ordering::Relaxed) {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -467,6 +477,8 @@ fn setup_serial_pipes() -> Result<
                     let _ = stdout.flush();
                     output_monitor_clone.push(bytes);
                 }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
                     eprintln!("Failed to read serial output: {}", e);
                     break;
@@ -475,7 +487,7 @@ fn setup_serial_pipes() -> Result<
         }
     });
 
-    let stdin_thread = start_stdin_forwarder(input_tx.clone());
+    let stdin_thread = start_stdin_forwarder(input_tx.clone(), Arc::clone(&running));
 
     let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
         NSFileHandle::alloc(),
@@ -495,22 +507,33 @@ fn setup_serial_pipes() -> Result<
         writer_thread,
         output_monitor,
         input_tx,
+        running,
     };
 
     Ok((ns_read_handle, ns_write_handle, ctx))
 }
 
-fn start_stdin_forwarder(target_tx: mpsc::Sender<Vec<u8>>) -> thread::JoinHandle<()> {
+fn start_stdin_forwarder(
+    target_tx: mpsc::Sender<Vec<u8>>,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buf = [0u8; 4096];
-        loop {
+
+        while running.load(Ordering::Relaxed) {
             match input.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 Ok(n) => {
                     if target_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
                 }
                 Err(_) => break,
             }
@@ -659,6 +682,8 @@ fn run_vm(
 
     //`std::process::exit(0)` will terminate immediately, killing all threads. No destructors run.
 
+    serial_ctx.running.store(false, Ordering::SeqCst);
+
     drop(raw_guard);
     if let Some(handle) = script_thread {
         let _ = handle.join();
@@ -739,6 +764,8 @@ fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
 
     attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
     attributes.c_lflag &= !((libc::ICANON | libc::ECHO) as libc::tcflag_t);
+    attributes.c_cc[libc::VMIN] = 0;
+    attributes.c_cc[libc::VTIME] = 1;
 
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
         return Err(io::Error::last_os_error());
