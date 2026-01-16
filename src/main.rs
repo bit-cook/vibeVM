@@ -45,11 +45,10 @@ struct VmPaths {
     cache_dir: PathBuf,
     guest_mise_cache: PathBuf,
     instance_dir: PathBuf,
-    downloaded_image: PathBuf,
+    downloaded_qcow2: PathBuf,
     base_raw: PathBuf,
-    configured_base: PathBuf,
-    instance_disk: PathBuf,
-    machine_identifier: PathBuf,
+    configured_raw: PathBuf,
+    instance_raw: PathBuf,
     efi_variable_store: PathBuf,
     cargo_registry: PathBuf,
 }
@@ -75,7 +74,6 @@ impl VmPaths {
         let base_raw = cache_dir.join("base.raw");
         let configured_base = cache_dir.join("configured_base.raw");
         let instance_disk = instance_dir.join("instance.raw");
-        let machine_identifier = instance_dir.join("machine.id");
         let efi_variable_store = instance_dir.join("efi-variable-store");
         let cargo_registry = home.join(".cargo/registry");
 
@@ -85,15 +83,20 @@ impl VmPaths {
             cache_dir,
             guest_mise_cache,
             instance_dir,
-            downloaded_image,
+            downloaded_qcow2: downloaded_image,
             base_raw,
-            configured_base,
-            instance_disk,
-            machine_identifier,
+            configured_raw: configured_base,
+            instance_raw: instance_disk,
             efi_variable_store,
             cargo_registry,
         })
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum WaitResult {
+    Timeout,
+    Found,
 }
 
 struct OutputMonitor {
@@ -115,23 +118,22 @@ impl OutputMonitor {
         self.condvar.notify_all();
     }
 
-    fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut buf = self.buffer.lock().unwrap();
-        loop {
-            if buf.contains(needle) {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let remaining = deadline - now;
-            let (new_buf, wait_res) = self.condvar.wait_timeout(buf, remaining).unwrap();
-            buf = new_buf;
-            if wait_res.timed_out() && buf.contains(needle) {
-                return true;
-            }
+    fn wait_for(&self, needle: &str, timeout: Duration) -> WaitResult {
+        let result = self
+            .condvar
+            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
+                if let Some((_, remaining)) = buf.split_once(needle) {
+                    *buf = remaining.to_string();
+                    false
+                } else {
+                    true
+                }
+            });
+
+        if result.unwrap().1.timed_out() {
+            WaitResult::Timeout
+        } else {
+            WaitResult::Found
         }
     }
 }
@@ -139,9 +141,9 @@ impl OutputMonitor {
 struct SerialContext {
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<Vec<u8>>,
-    stdout_thread: Option<thread::JoinHandle<()>>,
-    writer_thread: Option<thread::JoinHandle<()>>,
-    stdin_thread: Option<thread::JoinHandle<()>>,
+    stdout_thread: thread::JoinHandle<()>,
+    writer_thread: thread::JoinHandle<()>,
+    stdin_thread: thread::JoinHandle<()>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,10 +155,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_configured_base(&paths)?;
 
-    let provision_needed = ensure_instance_disk(&paths)?;
+    ensure_instance_disk(&paths)?;
 
-    let config = create_vm_configuration(&paths, &paths.instance_disk)?;
-    run_vm(config, provision_needed, &paths, MountMode::SkipMounts)
+    let config = create_vm_configuration(&paths, &paths.instance_raw)?;
+    run_vm(config, Some(""))
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -168,10 +170,10 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.downloaded_image.exists() {
+    if paths.downloaded_qcow2.exists() {
         println!(
             "Reusing cached base image at {}",
-            paths.downloaded_image.display()
+            paths.downloaded_qcow2.display()
         );
     } else {
         println!("Downloading Debian cloud image...");
@@ -181,7 +183,7 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
                 "-f",
                 DEBIAN_DISK_URL,
                 "-o",
-                paths.downloaded_image.to_string_lossy().as_ref(),
+                paths.downloaded_qcow2.to_string_lossy().as_ref(),
             ])
             .status()?;
 
@@ -190,16 +192,16 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
-    if !validate_image(&paths.downloaded_image, "cached base image") {
+    if !validate_image(&paths.downloaded_qcow2, "cached base image") {
         println!("Cached base image invalid, redownloading...");
-        fs::remove_file(&paths.downloaded_image).ok();
+        fs::remove_file(&paths.downloaded_qcow2).ok();
         let status = Command::new("curl")
             .args([
                 "-L",
                 "-f",
                 DEBIAN_DISK_URL,
                 "-o",
-                paths.downloaded_image.to_string_lossy().as_ref(),
+                paths.downloaded_qcow2.to_string_lossy().as_ref(),
             ])
             .status()?;
 
@@ -230,7 +232,7 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
             "convert",
             "-O",
             "raw",
-            paths.downloaded_image.to_string_lossy().as_ref(),
+            paths.downloaded_qcow2.to_string_lossy().as_ref(),
             paths.base_raw.to_string_lossy().as_ref(),
         ])
         .status()?;
@@ -248,41 +250,41 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.configured_base.exists() {
+    if paths.configured_raw.exists() {
         println!(
             "Using cached configured base at {}",
-            paths.configured_base.display()
+            paths.configured_raw.display()
         );
         return Ok(());
     }
 
     println!("Preparing configured base image...");
-    clone_sparse(&paths.base_raw, &paths.configured_base)?;
-    resize_file(&paths.configured_base, DISK_SIZE_GB)?;
+    clone_sparse(&paths.base_raw, &paths.configured_raw)?;
+    resize_file(&paths.configured_raw, DISK_SIZE_GB)?;
 
-    let config = create_vm_configuration(paths, &paths.configured_base)?;
-    run_vm(config, true, paths, MountMode::SkipMounts)?;
+    let config = create_vm_configuration(paths, &paths.configured_raw)?;
+    run_vm(config, Some(&format_provision_script(&paths.project_name)))?;
 
     Ok(())
 }
 
-fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Error>> {
-    if paths.instance_disk.exists() {
-        if validate_image(&paths.instance_disk, "instance raw") {
+fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.instance_raw.exists() {
+        if validate_image(&paths.instance_raw, "instance raw") {
             println!(
                 "Using existing instance disk at {}",
-                paths.instance_disk.display()
+                paths.instance_raw.display()
             );
-            return Ok(false);
+            return Ok(());
         }
         println!("Instance disk invalid, recreating...");
-        fs::remove_file(&paths.instance_disk).ok();
+        fs::remove_file(&paths.instance_raw).ok();
     }
 
-    println!("Creating instance disk from cached base image...");
-    clone_sparse(&paths.configured_base, &paths.instance_disk)?;
-    resize_file(&paths.instance_disk, DISK_SIZE_GB)?;
-    Ok(true)
+    println!("Creating instance disk from configured base image...");
+    clone_sparse(&paths.configured_raw, &paths.instance_raw)?;
+    resize_file(&paths.instance_raw, DISK_SIZE_GB)?;
+    Ok(())
 }
 
 fn create_vm_configuration(
@@ -292,8 +294,6 @@ fn create_vm_configuration(
     unsafe {
         let platform =
             VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
-        let machine_id = load_machine_identifier(paths)?;
-        platform.setMachineIdentifier(&machine_id);
 
         let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
         let variable_store = load_efi_variable_store(paths)?;
@@ -343,11 +343,8 @@ fn create_vm_configuration(
         let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
         config.setDirectorySharingDevices(&share_devices);
 
-        let (serial_read_handle, serial_write_handle, mut serial_ctx) = setup_serial_pipes()?;
-        serial_ctx.stdin_thread = start_stdin_forwarder(serial_ctx.input_tx.clone());
+        let (serial_read_handle, serial_write_handle, serial_ctx) = setup_serial_pipes()?;
 
-        // Single bidirectional serial port: guest reads from our pipe (which stdin + injector write),
-        // guest writes to our pipe (tee to log + stdout).
         let serial_attach =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
@@ -369,33 +366,6 @@ fn create_vm_configuration(
         })?;
 
         Ok((config, serial_ctx))
-    }
-}
-
-fn load_machine_identifier(
-    paths: &VmPaths,
-) -> Result<Retained<VZGenericMachineIdentifier>, Box<dyn std::error::Error>> {
-    unsafe {
-        if paths.machine_identifier.exists() {
-            let url = nsurl_from_path(&paths.machine_identifier)?;
-            if let Some(data) = NSData::dataWithContentsOfURL(&url) {
-                if let Some(id) = VZGenericMachineIdentifier::initWithDataRepresentation(
-                    VZGenericMachineIdentifier::alloc(),
-                    &data,
-                ) {
-                    return Ok(id);
-                }
-            }
-            println!("Existing machine identifier is invalid, regenerating...");
-        }
-
-        let id = VZGenericMachineIdentifier::init(VZGenericMachineIdentifier::alloc());
-        let data = id.dataRepresentation();
-        let url = nsurl_from_path(&paths.machine_identifier)?;
-        if !data.writeToURL_atomically(&url, true) {
-            return Err("Failed to persist machine identifier".into());
-        }
-        Ok(id)
     }
 }
 
@@ -425,17 +395,16 @@ fn load_efi_variable_store(
 }
 
 fn start_script_thread(
-    script: String,
+    script: &str,
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<Vec<u8>>,
 ) -> thread::JoinHandle<()> {
+    let script = script.to_string();
     thread::spawn(move || {
-        // Wait for getty/login prompt to appear, then log in and run the script.
-        if !output_monitor.wait_for("login:", Duration::from_secs(120)) {
-            eprintln!("Timed out waiting for login prompt; skipping injected script");
+        if WaitResult::Timeout == output_monitor.wait_for("login: ", Duration::from_secs(120)) {
+            eprintln!("Timed out waiting for system login prompt; not sending script.");
             return;
         }
-        eprintln!("provisioning...");
 
         let do_write = |payload: &str| {
             if let Err(e) = input_tx.send(payload.as_bytes().to_vec()) {
@@ -444,29 +413,20 @@ fn start_script_thread(
         };
 
         do_write("root\n");
-        std::thread::sleep(Duration::from_millis(500));
 
+        if WaitResult::Timeout == output_monitor.wait_for("~#", Duration::from_secs(120)) {
+            eprintln!("Timed out waiting for root shell; not sending script");
+            return;
+        }
+        let path = "provisioning_script.sh";
         do_write(&format!(
-            "cat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+            "cat >{path} <<'EOF'\n{script}EOF\nchmod +x {path}\n{path}\n"
         ));
     })
 }
 
 fn format_provision_script(project_name: &str) -> String {
     PROVISION_SCRIPT.replace("{project_name}", project_name)
-}
-
-fn format_mount_script(paths: &VmPaths) -> String {
-    format!(
-        r#"root
-mkdir -p /home/vibe/.cargo/registry /home/vibe/.local/share/mise /home/vibe/{project} || true
-mount -t virtiofs cargo_registry /home/vibe/.cargo/registry || true
-mount -t virtiofs mise_cache /home/vibe/.local/share/mise || true
-mount -t virtiofs current_dir /home/vibe/{project} || true
-chown -R vibe:vibe /home/vibe/.cargo /home/vibe/.local/share/mise /home/vibe/{project} || true
-"#,
-        project = paths.project_name
-    )
 }
 
 fn setup_serial_pipes() -> Result<
@@ -515,6 +475,8 @@ fn setup_serial_pipes() -> Result<
         }
     });
 
+    let stdin_thread = start_stdin_forwarder(input_tx.clone());
+
     let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
         NSFileHandle::alloc(),
         to_guest_vm.into_raw_fd(),
@@ -528,18 +490,18 @@ fn setup_serial_pipes() -> Result<
     );
 
     let ctx = SerialContext {
+        stdin_thread,
+        stdout_thread,
+        writer_thread,
         output_monitor,
         input_tx,
-        stdout_thread: Some(stdout_thread),
-        writer_thread: Some(writer_thread),
-        stdin_thread: None,
     };
 
     Ok((ns_read_handle, ns_write_handle, ctx))
 }
 
-fn start_stdin_forwarder(target_tx: mpsc::Sender<Vec<u8>>) -> Option<thread::JoinHandle<()>> {
-    Some(thread::spawn(move || {
+fn start_stdin_forwarder(target_tx: mpsc::Sender<Vec<u8>>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let mut input = io::stdin();
         let mut buf = [0u8; 4096];
         loop {
@@ -553,7 +515,7 @@ fn start_stdin_forwarder(target_tx: mpsc::Sender<Vec<u8>>) -> Option<thread::Joi
                 Err(_) => break,
             }
         }
-    }))
+    })
 }
 
 fn create_disk_attachment(
@@ -604,23 +566,16 @@ fn create_directory_share(
     }
 }
 
-enum MountMode {
-    SkipMounts,
-    MountAndChown,
-}
-
 fn run_vm(
     config: (Retained<VZVirtualMachineConfiguration>, SerialContext),
-    provision: bool,
-    paths: &VmPaths,
-    mount_mode: MountMode,
+    login_script: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting VM with Apple Virtualization Framework...");
 
     let queue = DispatchQueue::main();
-    let (config, mut serial_ctx) = config;
+    let (config, serial_ctx) = config;
     let vm = unsafe {
-        VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
+        VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, queue)
     };
 
     let initial_state = unsafe { vm.state() };
@@ -646,25 +601,13 @@ fn run_vm(
         vm.startWithCompletionHandler(&completion_handler);
     }
 
-    let provision_thread = if provision {
-        let script = format_provision_script(&paths.project_name);
-        Some(start_script_thread(
-            script,
+    let script_thread = login_script.map(|s| {
+        start_script_thread(
+            s,
             Arc::clone(&serial_ctx.output_monitor),
             serial_ctx.input_tx.clone(),
-        ))
-    } else {
-        None
-    };
-
-    let mount_thread = match mount_mode {
-        MountMode::SkipMounts => None,
-        MountMode::MountAndChown => Some(start_script_thread(
-            format_mount_script(paths),
-            Arc::clone(&serial_ctx.output_monitor),
-            serial_ctx.input_tx.clone(),
-        )),
-    };
+        )
+    });
 
     let start_deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < start_deadline {
@@ -714,23 +657,20 @@ fn run_vm(
         }
     }
 
+    //`std::process::exit(0)` will terminate immediately, killing all threads. No destructors run.
+
     drop(raw_guard);
-    if let Some(handle) = provision_thread {
+    if let Some(handle) = script_thread {
         let _ = handle.join();
     }
-    if let Some(handle) = mount_thread {
-        let _ = handle.join();
-    }
+    dbg!("0");
     drop(serial_ctx.input_tx);
-    if let Some(handle) = serial_ctx.writer_thread.take() {
-        let _ = handle.join();
-    }
-    if let Some(handle) = serial_ctx.stdout_thread.take() {
-        let _ = handle.join();
-    }
-    if let Some(handle) = serial_ctx.stdin_thread.take() {
-        let _ = handle.join();
-    }
+    let _ = serial_ctx.writer_thread.join();
+    dbg!("1");
+    let _ = serial_ctx.stdout_thread.join();
+    dbg!("2");
+    let _ = serial_ctx.stdin_thread.join();
+    dbg!("3");
     Ok(())
 }
 

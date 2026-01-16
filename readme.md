@@ -140,7 +140,9 @@ file.set_len(size_bytes)?;
 ```
 
 won't actually consume any disk space until the new parts of the file are written to.
-You can run `ls -lsh some-file` to see the used blocks (first column) compared to the allocated space.
-For example, this file is sized as 10GB but only uses about 2GB of blocks:
+You can run `ls -lsh some-file` to see the used 512-byte blocks (first column) compared to the allocated space.
+For example, this file is sized as 10GB but only uses about 2_382_272 × 512 byte = 1.22 GB on disk.
 
     2382272 -rw-r--r--@ 1 klynagh  staff    10G Jan 15 22:08 some-file
+
+You can also use `du -h some-file` to show actual disk usage in human readable output `1.2G some-file`
