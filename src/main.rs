@@ -1,11 +1,13 @@
 use std::env;
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +30,7 @@ use objc2_virtualization::{
 };
 
 const DEBIAN_DISK_URL: &str =
-    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2";
+    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.qcow2";
 const PROVISION_SCRIPT: &str = include_str!("../provisioning/provision.sh");
 
 const DISK_SIZE_GB: u64 = 10;
@@ -47,11 +49,9 @@ struct VmPaths {
     base_raw: PathBuf,
     configured_base: PathBuf,
     instance_disk: PathBuf,
-    cloud_init_iso: PathBuf,
     machine_identifier: PathBuf,
     efi_variable_store: PathBuf,
     cargo_registry: PathBuf,
-    console_log: PathBuf,
 }
 
 impl VmPaths {
@@ -75,11 +75,9 @@ impl VmPaths {
         let base_raw = cache_dir.join("base.raw");
         let configured_base = cache_dir.join("configured_base.raw");
         let instance_disk = instance_dir.join("instance.raw");
-        let cloud_init_iso = cache_dir.join("cloud-init.iso");
         let machine_identifier = instance_dir.join("machine.id");
         let efi_variable_store = instance_dir.join("efi-variable-store");
         let cargo_registry = home.join(".cargo/registry");
-        let console_log = instance_dir.join("console.log");
 
         Ok(Self {
             project_root,
@@ -91,24 +89,68 @@ impl VmPaths {
             base_raw,
             configured_base,
             instance_disk,
-            cloud_init_iso,
             machine_identifier,
             efi_variable_store,
             cargo_registry,
-            console_log,
         })
     }
+}
+
+struct OutputMonitor {
+    buffer: Mutex<String>,
+    condvar: Condvar,
+}
+
+impl OutputMonitor {
+    fn new() -> Self {
+        Self {
+            buffer: Mutex::new(String::new()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut buf = self.buffer.lock().unwrap();
+        buf.push_str(&String::from_utf8_lossy(bytes));
+        self.condvar.notify_all();
+    }
+
+    fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut buf = self.buffer.lock().unwrap();
+        loop {
+            if buf.contains(needle) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline - now;
+            let (new_buf, wait_res) = self.condvar.wait_timeout(buf, remaining).unwrap();
+            buf = new_buf;
+            if wait_res.timed_out() && buf.contains(needle) {
+                return true;
+            }
+        }
+    }
+}
+
+struct SerialContext {
+    output_monitor: Arc<OutputMonitor>,
+    input_tx: mpsc::Sender<Vec<u8>>,
+    stdout_thread: Option<thread::JoinHandle<()>>,
+    writer_thread: Option<thread::JoinHandle<()>>,
+    stdin_thread: Option<thread::JoinHandle<()>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = VmPaths::new()?;
 
     prepare_directories(&paths)?;
-    create_console_log(&paths)?;
     download_base_image(&paths)?;
     convert_to_raw(&paths)?;
-    //TODO: only create this iso when configuring the base, not every run.
-    create_cloud_init_iso(&paths)?;
+
     ensure_configured_base(&paths)?;
 
     let provision_needed = ensure_instance_disk(&paths)?;
@@ -224,78 +266,6 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn create_cloud_init_iso(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Building cloud-init ISO...");
-    let data_dir = paths.cache_dir.join("cloud-init-data");
-    if data_dir.exists() {
-        fs::remove_dir_all(&data_dir)?;
-    }
-    fs::create_dir_all(&data_dir)?;
-
-    let meta_data = format!(
-        "instance-id: {}\nlocal-hostname: {}\n",
-        paths.project_name, paths.project_name
-    );
-
-    let user_data = cloud_init_user_data();
-
-    fs::write(data_dir.join("meta-data"), meta_data)?;
-    fs::write(data_dir.join("user-data"), user_data)?;
-
-    if paths.cloud_init_iso.exists() {
-        fs::remove_file(&paths.cloud_init_iso)?;
-    }
-
-    let status = Command::new("hdiutil")
-        .args([
-            "makehybrid",
-            "-o",
-            paths.cloud_init_iso.to_string_lossy().as_ref(),
-            "-iso",
-            "-joliet",
-            "-default-volume-name",
-            "cidata",
-            data_dir.to_string_lossy().as_ref(),
-        ])
-        .status()?;
-
-    fs::remove_dir_all(&data_dir)?;
-
-    if !status.success() {
-        return Err("Failed to build cloud-init ISO".into());
-    }
-
-    Ok(())
-}
-
-fn cloud_init_user_data() -> String {
-    r#"#cloud-config
-datasource_list: [NoCloud, None]
-datasource:
-  NoCloud:
-    seedfrom: /dev/sr1
-network:
-  config: disabled
-bootcmd:
-  - systemctl mask systemd-networkd-wait-online.service
-  - systemctl mask systemd-time-wait-sync.service
-  - systemctl mask systemd-timesyncd.service
-users:
-  - name: user
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: false
-ssh_pwauth: true
-disable_ec2_metadata: true
-manual_cache_clean: true
-runcmd:
-  - sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
-  - passwd -d user
-  - systemctl restart sshd
-"#
-    .to_string()
-}
-
 fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Error>> {
     if paths.instance_disk.exists() {
         if validate_image(&paths.instance_disk, "instance raw") {
@@ -315,28 +285,10 @@ fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Err
     Ok(true)
 }
 
-fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    // Fresh log each run so users can tail for console output.
-    fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&paths.console_log)?;
-    Ok(())
-}
-
 fn create_vm_configuration(
     paths: &VmPaths,
     disk_path: &Path,
-) -> Result<
-    (
-        Retained<VZVirtualMachineConfiguration>,
-        Option<thread::JoinHandle<()>>,
-        Option<thread::JoinHandle<()>>,
-        RawFd,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(Retained<VZVirtualMachineConfiguration>, SerialContext), Box<dyn std::error::Error>> {
     unsafe {
         let platform =
             VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
@@ -359,16 +311,8 @@ fn create_vm_configuration(
             &disk_attachment,
         );
 
-        let cloud_init_attachment = create_disk_attachment(&paths.cloud_init_iso, true)?;
-        let cloud_init_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-            VZVirtioBlockDeviceConfiguration::alloc(),
-            &cloud_init_attachment,
-        );
-
-        let storage_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-            Retained::into_super(disk_device),
-            Retained::into_super(cloud_init_device),
-        ]);
+        let storage_devices: Retained<NSArray<_>> =
+            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
 
         config.setStorageDevices(&storage_devices);
 
@@ -399,9 +343,8 @@ fn create_vm_configuration(
         let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
         config.setDirectorySharingDevices(&share_devices);
 
-        let (serial_read_handle, serial_write_handle, inject_write_fd, tee_thread) =
-            tee_console_to_log(&paths.console_log)?;
-        let stdin_forward_thread = start_stdin_forwarder(inject_write_fd);
+        let (serial_read_handle, serial_write_handle, mut serial_ctx) = setup_serial_pipes()?;
+        serial_ctx.stdin_thread = start_stdin_forwarder(serial_ctx.input_tx.clone());
 
         // Single bidirectional serial port: guest reads from our pipe (which stdin + injector write),
         // guest writes to our pipe (tee to log + stdout).
@@ -425,7 +368,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok((config, tee_thread, stdin_forward_thread, inject_write_fd))
+        Ok((config, serial_ctx))
     }
 }
 
@@ -483,58 +426,34 @@ fn load_efi_variable_store(
 
 fn start_script_thread(
     script: String,
-    log_path: PathBuf,
-    inject_fd: RawFd,
+    output_monitor: Arc<OutputMonitor>,
+    input_tx: mpsc::Sender<Vec<u8>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Wait for getty/login prompt to appear, then log in and run the script.
-        if !wait_for_login(&log_path) {
+        if !output_monitor.wait_for("login:", Duration::from_secs(120)) {
             eprintln!("Timed out waiting for login prompt; skipping injected script");
             return;
         }
         eprintln!("provisioning...");
 
-        //  // Duplicate the write fd so we don't close the one held by the serial port.
-        //  unsafe {
-        //      let dup_fd = libc::dup(inject_fd);
-        //      if dup_fd < 0 {
-        //          eprintln!("Failed to dup inject fd: {}", io::Error::last_os_error());
-        //          return;
-        //      }
-        //      let mut stdin = File::from_raw_fd(dup_fd);
+        let do_write = |payload: &str| {
+            if let Err(e) = input_tx.send(payload.as_bytes().to_vec()) {
+                eprintln!("Failed to write payload to VM serial: {}", e);
+            }
+        };
 
-        //      let mut do_write = |payload: &str| {
-        //          if let Err(e) = stdin.write_all(payload.as_bytes()) {
-        //              eprintln!("Failed to write payload to VM serial: {}", e);
-        //          }
-        //          let _ = stdin.flush();
-        //      };
+        do_write("root\n");
+        std::thread::sleep(Duration::from_millis(500));
 
-        //      do_write("root\n");
-        //      std::thread::sleep(Duration::from_millis(500));
-
-        //      do_write( &format!(
-        //     "root\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
-        // ));
-        //  }
+        do_write(&format!(
+            "cat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+        ));
     })
 }
 
 fn format_provision_script(project_name: &str) -> String {
     PROVISION_SCRIPT.replace("{project_name}", project_name)
-}
-
-fn wait_for_login(log_path: &Path) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(log_path) {
-            if contents.contains("login:") {
-                return true;
-            }
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    false
 }
 
 fn format_mount_script(paths: &VmPaths) -> String {
@@ -550,97 +469,86 @@ chown -R vibe:vibe /home/vibe/.cargo /home/vibe/.local/share/mise /home/vibe/{pr
     )
 }
 
-fn tee_console_to_log(
-    log_path: &Path,
-) -> Result<
+fn setup_serial_pipes() -> Result<
     (
         Retained<NSFileHandle>,
         Retained<NSFileHandle>,
-        RawFd,
-        Option<thread::JoinHandle<()>>,
+        SerialContext,
     ),
     Box<dyn std::error::Error>,
 > {
-    // Pipe for guest output: guest writes to out_write_fd, we read from out_read_fd
-    let mut out_fds = [0; 2];
-    if unsafe { libc::pipe(out_fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let out_read_fd = out_fds[0];
-    let out_write_fd = out_fds[1];
+    // UnixStream pairs give us bidirectional pipes without libc::pipe.
+    let (to_guest_host, to_guest_vm) = UnixStream::pair()?;
+    let (from_guest_vm, from_guest_host) = UnixStream::pair()?;
 
-    // Pipe for guest input: we write to in_write_fd, guest reads from in_read_fd
-    let mut in_fds = [0; 2];
-    if unsafe { libc::pipe(in_fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let in_read_fd = in_fds[0];
-    let in_write_fd = in_fds[1];
-
-    // NSFileHandle for guest to read from (our injected input)
-    let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-        NSFileHandle::alloc(),
-        in_read_fd,
-        true,
-    );
-
-    // NSFileHandle for guest to write to (console output)
-    let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-        NSFileHandle::alloc(),
-        out_write_fd,
-        true,
-    );
-
-    let log_path = log_path.to_path_buf();
-    let tee_thread = thread::spawn(move || {
-        let mut reader = unsafe { File::from_raw_fd(out_read_fd) };
-        let mut log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .ok();
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
+    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    let writer_thread = thread::spawn(move || {
+        let mut writer = to_guest_host;
+        for chunk in input_rx {
+            if writer.write_all(&chunk).is_err() {
                 break;
             }
-            if let Some(file) = log.as_mut() {
-                let _ = file.write_all(&buf[..n]);
-                let _ = file.flush();
-            }
-            let _ = io::stdout().write_all(&buf[..n]);
-            let _ = io::stdout().flush();
+            let _ = writer.flush();
         }
     });
 
-    Ok((
-        ns_read_handle,
-        ns_write_handle,
-        in_write_fd,
-        Some(tee_thread),
-    ))
+    let output_monitor = Arc::new(OutputMonitor::new());
+    let output_monitor_clone = Arc::clone(&output_monitor);
+    let stdout_thread = thread::spawn(move || {
+        let mut stdout = io::stdout();
+        let mut reader = from_guest_host;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let bytes = &buf[..n];
+                    let _ = stdout.write_all(bytes);
+                    let _ = stdout.flush();
+                    output_monitor_clone.push(bytes);
+                }
+                Err(e) => {
+                    eprintln!("Failed to read serial output: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+        NSFileHandle::alloc(),
+        to_guest_vm.into_raw_fd(),
+        true,
+    );
+
+    let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+        NSFileHandle::alloc(),
+        from_guest_vm.into_raw_fd(),
+        true,
+    );
+
+    let ctx = SerialContext {
+        output_monitor,
+        input_tx,
+        stdout_thread: Some(stdout_thread),
+        writer_thread: Some(writer_thread),
+        stdin_thread: None,
+    };
+
+    Ok((ns_read_handle, ns_write_handle, ctx))
 }
 
-fn start_stdin_forwarder(target_fd: RawFd) -> Option<thread::JoinHandle<()>> {
-    let dup_fd = unsafe { libc::dup(target_fd) };
-    if dup_fd < 0 {
-        eprintln!(
-            "Failed to dup target fd for stdin forward: {}",
-            io::Error::last_os_error()
-        );
-        return None;
-    }
+fn start_stdin_forwarder(target_tx: mpsc::Sender<Vec<u8>>) -> Option<thread::JoinHandle<()>> {
     Some(thread::spawn(move || {
         let mut input = io::stdin();
-        let mut out = unsafe { File::from_raw_fd(dup_fd) };
         let mut buf = [0u8; 4096];
         loop {
             match input.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = out.write_all(&buf[..n]);
-                    let _ = out.flush();
+                    if target_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -702,12 +610,7 @@ enum MountMode {
 }
 
 fn run_vm(
-    config: (
-        Retained<VZVirtualMachineConfiguration>,
-        Option<thread::JoinHandle<()>>,
-        Option<thread::JoinHandle<()>>,
-        RawFd,
-    ),
+    config: (Retained<VZVirtualMachineConfiguration>, SerialContext),
     provision: bool,
     paths: &VmPaths,
     mount_mode: MountMode,
@@ -715,7 +618,7 @@ fn run_vm(
     println!("Starting VM with Apple Virtualization Framework...");
 
     let queue = DispatchQueue::main();
-    let (config, tee_handle, stdin_thread, inject_fd) = config;
+    let (config, mut serial_ctx) = config;
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
     };
@@ -727,7 +630,7 @@ fn run_vm(
         initial_state
     );
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
 
     let completion_handler = RcBlock::new(move |error: *mut NSError| {
         if error.is_null() {
@@ -747,8 +650,8 @@ fn run_vm(
         let script = format_provision_script(&paths.project_name);
         Some(start_script_thread(
             script,
-            paths.console_log.clone(),
-            inject_fd,
+            Arc::clone(&serial_ctx.output_monitor),
+            serial_ctx.input_tx.clone(),
         ))
     } else {
         None
@@ -758,8 +661,8 @@ fn run_vm(
         MountMode::SkipMounts => None,
         MountMode::MountAndChown => Some(start_script_thread(
             format_mount_script(paths),
-            paths.console_log.clone(),
-            inject_fd,
+            Arc::clone(&serial_ctx.output_monitor),
+            serial_ctx.input_tx.clone(),
         )),
     };
 
@@ -777,8 +680,8 @@ fn run_vm(
                 result.map_err(|e| format!("Failed to start VM: {}", e))?;
                 break;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
                 return Err("VM start channel disconnected".into());
             }
         }
@@ -818,10 +721,14 @@ fn run_vm(
     if let Some(handle) = mount_thread {
         let _ = handle.join();
     }
-    if let Some(handle) = tee_handle {
+    drop(serial_ctx.input_tx);
+    if let Some(handle) = serial_ctx.writer_thread.take() {
         let _ = handle.join();
     }
-    if let Some(handle) = stdin_thread {
+    if let Some(handle) = serial_ctx.stdout_thread.take() {
+        let _ = handle.join();
+    }
+    if let Some(handle) = serial_ctx.stdin_thread.take() {
         let _ = handle.join();
     }
     Ok(())
@@ -912,101 +819,3 @@ impl Drop for RawModeGuard {
         }
     }
 }
-
-// how can I have ctrl-c to go the guest vm rather than closing the entire vm and process?
-
-// You need to handle signals on the host side and forward them to the guest instead of letting them terminate your process.
-
-// Two approaches:
-
-// **1. Ignore SIGINT on host, let raw mode forward Ctrl-C as bytes**
-
-// Your raw mode setup already disables canonical mode, but you need to also disable signal generation from the terminal:
-
-// ```rust
-// fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
-//     let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-
-//     if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
-//         return Err(io::Error::last_os_error());
-//     }
-
-//     let original = attributes;
-
-//     attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
-//     attributes.c_lflag &= !((libc::ICANON | libc::ECHO | libc::ISIG) as libc::tcflag_t);
-
-//     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
-//         return Err(io::Error::last_os_error());
-//     }
-
-//     Ok(RawModeGuard { fd, original })
-// }
-// ```
-
-// Adding `libc::ISIG` to the mask disables SIGINT/SIGQUIT/SIGSUSP generation. Now Ctrl-C arrives as byte `0x03` which your stdin forwarder sends to the guest.
-
-// **2. Define an escape sequence to exit**
-
-// With ISIG disabled, you lose the ability to kill the host process via Ctrl-C. Common pattern: use an escape sequence like `~.` (tilde-dot, same as SSH):
-
-// ```rust
-// fn start_stdin_forwarder(target_fd: RawFd) -> Option<thread::JoinHandle<()>> {
-//     let dup_fd = unsafe { libc::dup(target_fd) };
-//     if dup_fd < 0 {
-//         eprintln!(
-//             "Failed to dup target fd for stdin forward: {}",
-//             io::Error::last_os_error()
-//         );
-//         return None;
-//     }
-//     Some(thread::spawn(move || {
-//         let mut input = io::stdin();
-//         let mut out = unsafe { File::from_raw_fd(dup_fd) };
-//         let mut buf = [0u8; 1];
-//         let mut last_was_newline = true;
-//         let mut last_was_tilde = false;
-
-//         loop {
-//             match input.read(&mut buf) {
-//                 Ok(0) => break,
-//                 Ok(1) => {
-//                     let byte = buf[0];
-
-//                     // Escape sequence: ~. after newline exits
-//                     if last_was_newline && byte == b'~' {
-//                         last_was_tilde = true;
-//                         last_was_newline = false;
-//                         continue; // Don't forward yet
-//                     }
-
-//                     if last_was_tilde {
-//                         if byte == b'.' {
-//                             eprintln!("\r\n[Connection closed]");
-//                             break; // Exit the forwarder, VM will continue but no input
-//                         }
-//                         // Not an escape, forward the delayed tilde
-//                         let _ = out.write_all(&[b'~']);
-//                         last_was_tilde = false;
-//                     }
-
-//                     last_was_newline = byte == b'\r' || byte == b'\n';
-//                     let _ = out.write_all(&buf);
-//                     let _ = out.flush();
-//                 }
-//                 Ok(_) => unreachable!(),
-//                 Err(_) => break,
-//             }
-//         }
-//     }))
-// }
-// ```
-
-// With this, type `~.` on a new line to disconnect from the console. Ctrl-C goes to guest.
-
-// mkdir -p .local/share/mise
-// sudo mount -t virtiofs mise_cache .local/share/mise
-// curl https://mise.run | sh
-// echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
-
-// vm only has network on first boot. when launching it again, there's no name resolution.

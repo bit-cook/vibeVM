@@ -1,0 +1,98 @@
+
+// how can I have ctrl-c to go the guest vm rather than closing the entire vm and process?
+
+// You need to handle signals on the host side and forward them to the guest instead of letting them terminate your process.
+
+// Two approaches:
+
+// **1. Ignore SIGINT on host, let raw mode forward Ctrl-C as bytes**
+
+// Your raw mode setup already disables canonical mode, but you need to also disable signal generation from the terminal:
+
+// ```rust
+// fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
+//     let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+
+//     if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
+//         return Err(io::Error::last_os_error());
+//     }
+
+//     let original = attributes;
+
+//     attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
+//     attributes.c_lflag &= !((libc::ICANON | libc::ECHO | libc::ISIG) as libc::tcflag_t);
+
+//     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
+//         return Err(io::Error::last_os_error());
+//     }
+
+//     Ok(RawModeGuard { fd, original })
+// }
+// ```
+
+// Adding `libc::ISIG` to the mask disables SIGINT/SIGQUIT/SIGSUSP generation. Now Ctrl-C arrives as byte `0x03` which your stdin forwarder sends to the guest.
+
+// **2. Define an escape sequence to exit**
+
+// With ISIG disabled, you lose the ability to kill the host process via Ctrl-C. Common pattern: use an escape sequence like `~.` (tilde-dot, same as SSH):
+
+// ```rust
+// fn start_stdin_forwarder(target_fd: RawFd) -> Option<thread::JoinHandle<()>> {
+//     let dup_fd = unsafe { libc::dup(target_fd) };
+//     if dup_fd < 0 {
+//         eprintln!(
+//             "Failed to dup target fd for stdin forward: {}",
+//             io::Error::last_os_error()
+//         );
+//         return None;
+//     }
+//     Some(thread::spawn(move || {
+//         let mut input = io::stdin();
+//         let mut out = unsafe { File::from_raw_fd(dup_fd) };
+//         let mut buf = [0u8; 1];
+//         let mut last_was_newline = true;
+//         let mut last_was_tilde = false;
+
+//         loop {
+//             match input.read(&mut buf) {
+//                 Ok(0) => break,
+//                 Ok(1) => {
+//                     let byte = buf[0];
+
+//                     // Escape sequence: ~. after newline exits
+//                     if last_was_newline && byte == b'~' {
+//                         last_was_tilde = true;
+//                         last_was_newline = false;
+//                         continue; // Don't forward yet
+//                     }
+
+//                     if last_was_tilde {
+//                         if byte == b'.' {
+//                             eprintln!("\r\n[Connection closed]");
+//                             break; // Exit the forwarder, VM will continue but no input
+//                         }
+//                         // Not an escape, forward the delayed tilde
+//                         let _ = out.write_all(&[b'~']);
+//                         last_was_tilde = false;
+//                     }
+
+//                     last_was_newline = byte == b'\r' || byte == b'\n';
+//                     let _ = out.write_all(&buf);
+//                     let _ = out.flush();
+//                 }
+//                 Ok(_) => unreachable!(),
+//                 Err(_) => break,
+//             }
+//         }
+//     }))
+// }
+// ```
+
+// With this, type `~.` on a new line to disconnect from the console. Ctrl-C goes to guest.
+
+// mkdir -p .local/share/mise
+// sudo mount -t virtiofs mise_cache .local/share/mise
+// curl https://mise.run | sh
+// echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+
+// vm only has network on first boot. when launching it again, there's no name resolution.
