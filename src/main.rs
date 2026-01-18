@@ -17,17 +17,17 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{
-    NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSRunLoop, NSString,
-    NSUInteger, NSURL,
+    NSArray, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSRunLoop, NSString, NSUInteger,
+    NSURL,
 };
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
-    VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
-    VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZNATNetworkDeviceAttachment,
+    VZSharedDirectory, VZSingleDirectoryShare, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration,
 };
 
 const DEBIAN_DISK_URL: &str =
@@ -67,9 +67,9 @@ impl VmPaths {
         let cache_home = env::var("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.join(".cache"));
-        let cache_dir = cache_home.join("vibetron");
+        let cache_dir = cache_home.join("vibe");
         let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-        let instance_dir = project_root.join(".vibetron");
+        let instance_dir = project_root.join(".vibe");
 
         let downloaded_image = cache_dir.join("downloaded.qcow2");
         let base_raw = cache_dir.join("base.raw");
@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = VmPaths::new()?;
 
     prepare_directories(&paths)?;
-    download_base_image(&paths)?;
+    ensure_base_image(&paths)?;
     convert_to_raw(&paths)?;
 
     ensure_configured_base(&paths)?;
@@ -160,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_instance_disk(&paths)?;
 
     let config = create_vm_configuration(&paths, &paths.instance_raw)?;
-    run_vm(config, Some(""))
+    run_vm(config, None)
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -171,14 +171,11 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.downloaded_qcow2.exists() {
-        println!(
-            "Reusing cached base image at {}",
-            paths.downloaded_qcow2.display()
-        );
+        println!("Reusing base image at {}", paths.downloaded_qcow2.display());
     } else {
-        println!("Downloading Debian cloud image...");
+        println!("Downloading Debian base image...");
         let status = Command::new("curl")
             .args([
                 "-L",
@@ -190,41 +187,25 @@ fn download_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
             .status()?;
 
         if !status.success() {
-            return Err("Failed to download Ubuntu cloud image".into());
+            return Err("Failed to download Debian base image".into());
         }
     }
 
-    if !validate_image(&paths.downloaded_qcow2, "cached base image") {
-        println!("Cached base image invalid, redownloading...");
-        fs::remove_file(&paths.downloaded_qcow2).ok();
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "-f",
-                DEBIAN_DISK_URL,
-                "-o",
-                paths.downloaded_qcow2.to_string_lossy().as_ref(),
-            ])
-            .status()?;
-
-        if !status.success() {
-            return Err("Failed to download Ubuntu cloud image".into());
-        }
-    }
+    validate_image(&paths.downloaded_qcow2, "base image");
 
     Ok(())
 }
 
 fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.base_raw.exists() {
-        if validate_image(&paths.base_raw, "cached base raw") {
+        if validate_image(&paths.base_raw, " base raw") {
             println!(
                 "Reusing converted base image at {}",
                 paths.base_raw.display()
             );
             return Ok(());
         }
-        println!("Cached base image invalid, regenerating...");
+        println!("base image invalid, regenerating...");
         fs::remove_file(&paths.base_raw).ok();
     }
 
@@ -247,7 +228,7 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
         .then_some(())
         .ok_or_else(|| io::Error::other("Converted base image failed validation"))?;
 
-    resize_file(&paths.base_raw, DISK_SIZE_GB)?;
+    resize(&paths.base_raw, DISK_SIZE_GB)?;
     Ok(())
 }
 
@@ -261,8 +242,8 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     }
 
     println!("Preparing configured base image...");
-    clone_sparse(&paths.base_raw, &paths.configured_raw)?;
-    resize_file(&paths.configured_raw, DISK_SIZE_GB)?;
+    fs::copy(&paths.base_raw, &paths.configured_raw)?;
+    resize(&paths.configured_raw, DISK_SIZE_GB)?;
 
     let config = create_vm_configuration(paths, &paths.configured_raw)?;
     run_vm(config, Some(&format_provision_script(&paths.project_name)))?;
@@ -284,8 +265,8 @@ fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error
     }
 
     println!("Creating instance disk from configured base image...");
-    clone_sparse(&paths.configured_raw, &paths.instance_raw)?;
-    resize_file(&paths.instance_raw, DISK_SIZE_GB)?;
+    fs::copy(&paths.configured_raw, &paths.instance_raw)?;
+    resize(&paths.instance_raw, DISK_SIZE_GB)?;
     Ok(())
 }
 
@@ -713,7 +694,7 @@ fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::E
     Ok(NSURL::fileURLWithPath(&ns_path))
 }
 
-fn resize_file(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn resize(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Error>> {
     let size_bytes = size_gb * 1024 * 1024 * 1024;
     let file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(size_bytes)?;
@@ -730,26 +711,6 @@ fn validate_image(path: &Path, label: &str) -> bool {
             eprintln!("Validation failed for {} at {}", label, path.display());
             false
         }
-    }
-}
-
-fn clone_sparse(src: &Path, dst: &Path) -> io::Result<()> {
-    let c_src = CString::new(src.as_os_str().as_bytes())?;
-    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
-
-    let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
-    if rc == 0 {
-        return Ok(());
-    }
-
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
-        fs::remove_file(dst).ok();
-    }
-
-    match fs::copy(src, dst) {
-        Ok(_) => Ok(()),
-        Err(copy_err) => Err(copy_err),
     }
 }
 
