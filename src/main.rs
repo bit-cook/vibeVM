@@ -739,7 +739,7 @@ struct RawModeGuard {
     fd: i32,
     original: libc::termios,
 }
-
+// TODO: replace with scopeguard so we fix the terminal even after a panic.
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe {
