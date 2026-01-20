@@ -2,11 +2,13 @@ use std::env;
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,22 +105,22 @@ enum WaitResult {
     Found,
 }
 
-struct OutputMonitor {
+#[derive(Default)]
+pub struct OutputMonitor {
     buffer: Mutex<String>,
     condvar: Condvar,
 }
 
 impl OutputMonitor {
     fn new() -> Self {
-        Self {
-            buffer: Mutex::new(String::new()),
-            condvar: Condvar::new(),
-        }
+        Default::default()
     }
 
     fn push(&self, bytes: &[u8]) {
-        let mut buf = self.buffer.lock().unwrap();
-        buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buffer
+            .lock()
+            .unwrap()
+            .push_str(&String::from_utf8_lossy(bytes));
         self.condvar.notify_all();
     }
 
@@ -142,13 +144,9 @@ impl OutputMonitor {
     }
 }
 
-struct SerialContext {
-    output_monitor: Arc<OutputMonitor>,
-    input_tx: mpsc::Sender<Vec<u8>>,
-    stdout_thread: thread::JoinHandle<()>,
-    writer_thread: thread::JoinHandle<()>,
-    stdin_thread: thread::JoinHandle<()>,
-    running: Arc<AtomicBool>,
+pub enum VmInput {
+    Bytes(Vec<u8>),
+    Shutdown,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -159,8 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured_base(&paths)?;
     ensure_instance_disk(&paths)?;
 
-    let config = create_vm_configuration(&paths, &paths.instance_raw)?;
-    run_vm(config, None)
+    run_vm(&paths, &paths.instance_raw, None)
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -219,8 +216,7 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     fs::copy(&paths.base_raw, &paths.configured_raw)?;
     resize(&paths.configured_raw, DISK_SIZE_GB)?;
 
-    let config = create_vm_configuration(paths, &paths.configured_raw)?;
-    run_vm(config, Some(&format_provision_script(&paths.project_name)))?;
+    run_vm(paths, &paths.configured_raw, Some(PROVISION_SCRIPT))?;
 
     Ok(())
 }
@@ -236,10 +232,147 @@ fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+pub struct IoContext {
+    pub input_tx: Sender<VmInput>,
+    shutdown_flag: Arc<AtomicBool>,
+    wakeup_write: OwnedFd,
+    stdin_thread: thread::JoinHandle<()>,
+    mux_thread: thread::JoinHandle<()>,
+    stdout_thread: thread::JoinHandle<()>,
+}
+
+pub fn create_pipe() -> (OwnedFd, OwnedFd) {
+    let (read_stream, write_stream) = UnixStream::pair().expect("Failed to create socket pair");
+    (read_stream.into(), write_stream.into())
+}
+
+pub fn spawn_vm_io(
+    output_monitor: Arc<OutputMonitor>,
+    vm_output_fd: OwnedFd,
+    vm_input_fd: OwnedFd,
+) -> IoContext {
+    let (input_tx, input_rx): (Sender<VmInput>, Receiver<VmInput>) = mpsc::channel();
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = shutdown_flag.clone();
+
+    let (wakeup_read, wakeup_write) = create_pipe();
+
+    // Copies from stdin to the VM; uses poll so we can break the loop and exit the thread when it's time to shutdown.
+    let stdin_thread = thread::spawn({
+        let input_tx = input_tx.clone();
+        move || {
+            let stdin_fd = libc::STDIN_FILENO;
+            let mut buf = [0u8; 64];
+
+            loop {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: stdin_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wakeup_read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                if ret <= 0 {
+                    break;
+                }
+
+                if fds[1].revents & libc::POLLIN != 0 {
+                    break;
+                }
+
+                if fds[0].revents & libc::POLLIN != 0 {
+                    let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        break;
+                    }
+                    if flag_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if input_tx
+                        .send(VmInput::Bytes(buf[..n as usize].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mux_thread = thread::spawn(move || {
+        let mut vm_writer = std::fs::File::from(vm_input_fd);
+        loop {
+            match input_rx.recv() {
+                Ok(VmInput::Bytes(data)) => {
+                    if vm_writer.write_all(&data).is_err() {
+                        break;
+                    }
+                }
+                Ok(VmInput::Shutdown) => break,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stdout_thread = thread::spawn(move || {
+        let mut vm_reader = std::fs::File::from(vm_output_fd);
+
+        let mut buf = [0u8; 1024];
+        loop {
+            match vm_reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // TODO: Ideally, we could lock for the entire lifetime of the thread, but I'm not sure how to interrupt the thread because the virtualization framework doesn't close the file descriptor when the VM shuts down.
+                    // so we'll just leak this thread =(
+                    let mut stdout = std::io::stdout().lock();
+                    let bytes = &buf[..n];
+                    if stdout.write_all(bytes).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                    output_monitor.push(bytes);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    IoContext {
+        input_tx,
+        shutdown_flag,
+        wakeup_write,
+        stdin_thread,
+        mux_thread,
+        stdout_thread,
+    }
+}
+
+impl IoContext {
+    pub fn shutdown(self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        let _ = self.input_tx.send(VmInput::Shutdown);
+        unsafe { libc::write(self.wakeup_write.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
+        let _ = self.stdin_thread.join();
+        let _ = self.mux_thread.join();
+
+        // Leak this thread because I can't figure out how to interrupt it.
+        drop(self.stdout_thread);
+    }
+}
+
 fn create_vm_configuration(
     paths: &VmPaths,
     disk_path: &Path,
-) -> Result<(Retained<VZVirtualMachineConfiguration>, SerialContext), Box<dyn std::error::Error>> {
+    vm_reads_from_fd: OwnedFd,
+    vm_writes_to_fd: OwnedFd,
+) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
     unsafe {
         let platform =
             VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
@@ -292,19 +425,30 @@ fn create_vm_configuration(
         let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
         config.setDirectorySharingDevices(&share_devices);
 
-        let (serial_read_handle, serial_write_handle, serial_ctx) = setup_serial_pipes()?;
+        let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_reads_from_fd.into_raw_fd(),
+            true,
+        );
+
+        let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            NSFileHandle::alloc(),
+            vm_writes_to_fd.into_raw_fd(),
+            true,
+        );
 
         let serial_attach =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
-                Some(&serial_read_handle),
-                Some(&serial_write_handle),
+                Some(&ns_read_handle),
+                Some(&ns_write_handle),
             );
         let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
         serial_port.setAttachment(Some(&serial_attach));
 
         let serial_ports: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(serial_port)]);
+
         config.setSerialPorts(&serial_ports);
 
         config.validateWithError().map_err(|e| {
@@ -314,7 +458,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok((config, serial_ctx))
+        Ok(config)
     }
 }
 
@@ -343,10 +487,10 @@ fn load_efi_variable_store(
     }
 }
 
-fn start_script_thread(
+fn start_provisioning_thread(
     script: &str,
     output_monitor: Arc<OutputMonitor>,
-    input_tx: mpsc::Sender<Vec<u8>>,
+    input_tx: mpsc::Sender<VmInput>,
 ) -> thread::JoinHandle<()> {
     let script = script.to_string();
     thread::spawn(move || {
@@ -356,7 +500,7 @@ fn start_script_thread(
         }
 
         let do_write = |payload: &str| {
-            if let Err(e) = input_tx.send(payload.as_bytes().to_vec()) {
+            if let Err(e) = input_tx.send(VmInput::Bytes(payload.as_bytes().to_vec())) {
                 eprintln!("Failed to write payload to VM serial: {}", e);
             }
         };
@@ -369,122 +513,6 @@ fn start_script_thread(
         }
         let path = "provisioning_script.sh";
         do_write(&format!("cat >{path} <<'EOF'\n{script}EOF\nsh {path}\n"));
-    })
-}
-
-fn format_provision_script(project_name: &str) -> String {
-    PROVISION_SCRIPT.replace("{project_name}", project_name)
-}
-
-fn setup_serial_pipes() -> Result<
-    (
-        Retained<NSFileHandle>,
-        Retained<NSFileHandle>,
-        SerialContext,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    // UnixStream pairs give us bidirectional pipes without libc::pipe.
-    let (to_guest_host, to_guest_vm) = UnixStream::pair()?;
-    let (from_guest_vm, from_guest_host) = UnixStream::pair()?;
-
-    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
-    let running = Arc::new(AtomicBool::new(true));
-    let writer_running = Arc::clone(&running);
-    let writer_thread = thread::spawn(move || {
-        let mut writer = to_guest_host;
-        while writer_running.load(Ordering::Relaxed) {
-            match input_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(chunk) => {
-                    if writer.write_all(&chunk).is_err() {
-                        break;
-                    }
-                    let _ = writer.flush();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    });
-
-    let output_monitor = Arc::new(OutputMonitor::new());
-    let output_monitor_clone = Arc::clone(&output_monitor);
-    let stdout_running = Arc::clone(&running);
-    let stdout_thread = thread::spawn(move || {
-        let mut stdout = io::stdout();
-        let mut reader = from_guest_host;
-        let mut buf = [0u8; 4096];
-        let _ = reader.set_read_timeout(Some(Duration::from_millis(20)));
-        while stdout_running.load(Ordering::Relaxed) {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let bytes = &buf[..n];
-                    let _ = stdout.write_all(bytes);
-                    let _ = stdout.flush();
-                    output_monitor_clone.push(bytes);
-                }
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    eprintln!("Failed to read serial output: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    let stdin_thread = start_stdin_forwarder(input_tx.clone(), Arc::clone(&running));
-
-    let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-        NSFileHandle::alloc(),
-        to_guest_vm.into_raw_fd(),
-        true,
-    );
-
-    let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-        NSFileHandle::alloc(),
-        from_guest_vm.into_raw_fd(),
-        true,
-    );
-
-    let ctx = SerialContext {
-        stdin_thread,
-        stdout_thread,
-        writer_thread,
-        output_monitor,
-        input_tx,
-        running,
-    };
-
-    Ok((ns_read_handle, ns_write_handle, ctx))
-}
-
-fn start_stdin_forwarder(
-    target_tx: mpsc::Sender<Vec<u8>>,
-    running: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut input = io::stdin();
-        let mut buf = [0u8; 4096];
-
-        while running.load(Ordering::Relaxed) {
-            match input.read(&mut buf) {
-                Ok(0) => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Ok(n) => {
-                    if target_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(_) => break,
-            }
-        }
     })
 }
 
@@ -537,47 +565,36 @@ fn create_directory_share(
 }
 
 fn run_vm(
-    config: (Retained<VZVirtualMachineConfiguration>, SerialContext),
+    paths: &VmPaths,
+    disk_path: &Path,
     login_script: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting VM with Apple Virtualization Framework...");
+    let (vm_reads_from, we_write_to) = create_pipe();
+    let (we_read_from, vm_writes_to) = create_pipe();
+
+    let config = create_vm_configuration(paths, disk_path, vm_reads_from, vm_writes_to)?;
+
+    println!("Starting VM");
 
     let queue = DispatchQueue::main();
-    let (config, serial_ctx) = config;
+
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, queue)
     };
 
-    let initial_state = unsafe { vm.state() };
-    println!(
-        "[start] canStart={} initial_state={:?}",
-        unsafe { vm.canStart() },
-        initial_state
-    );
-
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
-
     let completion_handler = RcBlock::new(move |error: *mut NSError| {
         if error.is_null() {
             let _ = tx.send(Ok(()));
         } else {
             let err = unsafe { &*error };
-            let desc = err.localizedDescription();
-            let _ = tx.send(Err(format!("{:?}", desc)));
+            let _ = tx.send(Err(format!("{:?}", err.localizedDescription())));
         }
     });
 
     unsafe {
         vm.startWithCompletionHandler(&completion_handler);
     }
-
-    let script_thread = login_script.map(|s| {
-        start_script_thread(
-            s,
-            Arc::clone(&serial_ctx.output_monitor),
-            serial_ctx.input_tx.clone(),
-        )
-    });
 
     let start_deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < start_deadline {
@@ -604,8 +621,15 @@ fn run_vm(
         return Err("Timed out waiting for VM to start".into());
     }
 
-    println!("VM started. Console attached to STDIN/STDOUT.");
-    let raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
+    println!("VM started, attaching console to STDIN/STDOUT.");
+
+    let output_monitor = Arc::new(OutputMonitor::new());
+    let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
+
+    let provisioning_thread = login_script
+        .map(|s| start_provisioning_thread(s, output_monitor.clone(), io_ctx.input_tx.clone()));
+
+    let _raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
 
     let mut last_state = None;
     loop {
@@ -618,31 +642,21 @@ fn run_vm(
 
         let state = unsafe { vm.state() };
         if last_state != Some(state) {
-            println!("[state] {:?}", state);
+            //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
-            println!("VM stopped with state: {:?}", state);
+            //eprintln!("VM stopped with state: {:?}", state);
             break;
         }
     }
 
-    //`std::process::exit(0)` will terminate immediately, killing all threads. No destructors run.
-
-    serial_ctx.running.store(false, Ordering::SeqCst);
-
-    drop(raw_guard);
-    if let Some(handle) = script_thread {
+    if let Some(handle) = provisioning_thread {
         let _ = handle.join();
     }
-    dbg!("0");
-    drop(serial_ctx.input_tx);
-    let _ = serial_ctx.writer_thread.join();
-    dbg!("1");
-    let _ = serial_ctx.stdout_thread.join();
-    dbg!("2");
-    let _ = serial_ctx.stdin_thread.join();
-    dbg!("3");
+
+    io_ctx.shutdown();
+
     Ok(())
 }
 
@@ -692,7 +706,7 @@ struct RawModeGuard {
     fd: i32,
     original: libc::termios,
 }
-// TODO: replace with scopeguard so we fix the terminal even after a panic.
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe {
