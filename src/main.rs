@@ -23,6 +23,7 @@ use objc2_virtualization::*;
 
 const DEBIAN_DISK_URL: &str =
     "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
+const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
@@ -75,7 +76,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let basename_compressed = DEBIAN_DISK_URL.rsplit('/').next().unwrap();
     let base_compressed = cache_dir.join(basename_compressed);
-
     let base_raw = cache_dir.join(format!(
         "{}.raw",
         basename_compressed.trim_end_matches(".tar.xz")
@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&cache_dir)?;
     fs::create_dir_all(&guest_mise_cache)?;
 
+    // TODO: would be nice to have this called by ensure_configured, rather than having it in main.
     ensure_base_image(&base_raw, &base_compressed)?;
 
     ensure_configured_base(&base_raw, &configured_raw)?;
@@ -97,20 +98,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     run_vm(
         &instance_raw,
-        &[],
+        &[
+            Type(format!("cd {}", project_name)),
+            // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
+            // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system, and
+            Type("mount -t tmpfs tmpfs .git/".into()),
+            Type("clear".into()),
+            // TODO: Add a nice entry message which shows the shared directories.
+        ],
         &[
             DirectoryShare {
                 host: cargo_registry,
-                guest: "/home/root/.cargo/registry".into(),
+                guest: "/root/.cargo/registry".into(),
                 read_only: false,
             },
             DirectoryShare {
                 host: guest_mise_cache,
-                guest: "/home/root/.local/share/mise".into(),
+                guest: "/root/.local/share/mise".into(),
                 read_only: false,
             },
             DirectoryShare {
-                guest: PathBuf::from("/home/root/").join(project_name),
+                guest: PathBuf::from("/root/").join(project_name),
                 host: project_root,
                 read_only: false,
             },
@@ -452,7 +460,8 @@ fn create_vm_configuration(
                     &url,
                     share.read_only,
                 );
-                let key = NSString::from_str(&share.guest.to_string_lossy());
+
+                let key = NSString::from_str(&share.tag());
                 directories.setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key));
             }
 
@@ -460,9 +469,10 @@ fn create_vm_configuration(
                 VZMultipleDirectoryShare::alloc(),
                 &directories,
             );
+
             let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str("shared"),
+                &NSString::from_str(SHARED_DIRECTORIES_TAG),
             );
             device.setShare(Some(&multi_share));
 
@@ -544,7 +554,8 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                Type(text) => {
+                Type(mut text) => {
+                    text.push('\n'); // Type the newline so the command is actually submitted.
                     input_tx
                         .send(VmInput::Bytes(text.into_bytes().to_vec()))
                         .unwrap();
@@ -563,8 +574,6 @@ fn run_vm(
     let (we_read_from, vm_writes_to) = create_pipe();
 
     let config = create_vm_configuration(disk_path, directory_shares, vm_reads_from, vm_writes_to)?;
-
-    println!("Starting VM");
 
     let queue = DispatchQueue::main();
 
@@ -611,22 +620,37 @@ fn run_vm(
         return Err("Timed out waiting for VM to start".into());
     }
 
-    println!("VM started, attaching console to STDIN/STDOUT.");
+    println!("VM booting...");
 
     let output_monitor = Arc::new(OutputMonitor::new());
     let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
 
-    let default_login_actions = vec![
+    let mut all_login_actions = vec![
         WaitFor("login: ".to_string()),
-        Type("root\n".to_string()),
+        Type("root".to_string()),
         WaitFor("~#".to_string()),
     ];
 
+    if !directory_shares.is_empty() {
+        all_login_actions.push(Type(format!(
+            "mount -t virtiofs {} /mnt/shared\n",
+            SHARED_DIRECTORIES_TAG
+        )));
+
+        for share in directory_shares {
+            let staging = format!("/mnt/shared/{}", share.tag());
+            let guest = share.guest.to_string_lossy();
+            all_login_actions.push(Type(format!("mkdir -p {}", guest)));
+            all_login_actions.push(Type(format!("mount --bind {} {}", staging, guest)));
+        }
+    }
+
+    for a in login_actions {
+        all_login_actions.push(a.clone())
+    }
+
     let login_actions_thread = spawn_login_actions_thread(
-        default_login_actions
-            .into_iter()
-            .chain(login_actions.iter().cloned())
-            .collect(),
+        all_login_actions,
         output_monitor.clone(),
         io_ctx.input_tx.clone(),
     );
