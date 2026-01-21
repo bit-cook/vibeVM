@@ -1,23 +1,25 @@
-use std::env;
-
-use std::fs;
-use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
-use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    env, fs,
+    io::{self, Read, Write},
+    os::unix::{
+        io::{AsRawFd, IntoRawFd, OwnedFd},
+        net::UnixStream,
+    },
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+        mpsc::{Receiver, Sender},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
+use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
@@ -99,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_vm(
         &instance_raw,
         &[
-            Type(format!("cd {}", project_name)),
+            Type(format!("cd {project_name}")),
             // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
             // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system, and
             Type("mount -t tmpfs tmpfs .git/".into()),
@@ -139,10 +141,6 @@ pub struct OutputMonitor {
 }
 
 impl OutputMonitor {
-    fn new() -> Self {
-        Default::default()
-    }
-
     fn push(&self, bytes: &[u8]) {
         self.buffer
             .lock()
@@ -152,7 +150,7 @@ impl OutputMonitor {
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) -> WaitResult {
-        let result = self
+        let (_unused, timeout_result) = self
             .condvar
             .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
                 if let Some((_, remaining)) = buf.split_once(needle) {
@@ -161,9 +159,10 @@ impl OutputMonitor {
                 } else {
                     true
                 }
-            });
+            })
+            .unwrap();
 
-        if result.unwrap().1.timed_out() {
+        if timeout_result.timed_out() {
             WaitResult::Timeout
         } else {
             WaitResult::Found
@@ -203,7 +202,7 @@ fn ensure_base_image(
     println!("Decompressing base image...");
     let status = Command::new("tar")
         .args(["-xOf", &base_compressed.to_string_lossy(), "disk.raw"])
-        .stdout(std::fs::File::create(base_raw).unwrap())
+        .stdout(std::fs::File::create(base_raw)?)
         .status()?;
 
     if !status.success() {
@@ -230,8 +229,14 @@ fn ensure_configured_base(
         configured_raw,
         &[Type({
             let path = "provision.sh";
-            let script = include_str!("../provisioning/provision.sh");
-            format!("cat >{path} <<'PROVISIONING_EOF'\n{script}PROVISIONING_EOF\nsh {path}\n")
+            let script = include_str!("provision.sh");
+            format!(
+                "cat >{path} <<'PROVISIONING_EOF'
+{script}
+PROVISIONING_EOF
+chmod +x {path}
+./{path}"
+            )
         })],
         &[],
     )?;
@@ -248,6 +253,7 @@ fn ensure_instance_disk(
     }
 
     println!("Creating instance disk from configured base image...");
+    std::fs::create_dir_all(instance_raw.parent().unwrap())?;
     fs::copy(configured_raw, instance_raw)?;
     resize(instance_raw, DISK_SIZE_GB)?;
     Ok(())
@@ -556,9 +562,7 @@ fn spawn_login_actions_thread(
                 }
                 Type(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
-                    input_tx
-                        .send(VmInput::Bytes(text.into_bytes().to_vec()))
-                        .unwrap();
+                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
                 }
             }
         }
@@ -622,7 +626,7 @@ fn run_vm(
 
     println!("VM booting...");
 
-    let output_monitor = Arc::new(OutputMonitor::new());
+    let output_monitor = Arc::new(OutputMonitor::default());
     let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
 
     let mut all_login_actions = vec![
@@ -632,8 +636,9 @@ fn run_vm(
     ];
 
     if !directory_shares.is_empty() {
+        all_login_actions.push(Type("mkdir -p /mnt/shared".into()));
         all_login_actions.push(Type(format!(
-            "mount -t virtiofs {} /mnt/shared\n",
+            "mount -t virtiofs {} /mnt/shared",
             SHARED_DIRECTORIES_TAG
         )));
 
