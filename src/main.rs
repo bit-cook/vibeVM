@@ -157,7 +157,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured_base(&paths)?;
     ensure_instance_disk(&paths)?;
 
-    run_vm(&paths, &paths.instance_raw, None)
+    run_vm(
+        &paths,
+        &paths.instance_raw,
+        vec![
+            LoginActions::WaitFor("login: ".to_string()),
+            LoginActions::Type("root\n".to_string()),
+        ],
+    )
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -170,7 +177,7 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
 
 fn ensure_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.base_raw.exists() {
-        println!("Reusing base image at {}", paths.base_raw.display());
+        println!("Using configured image at {}", paths.base_raw.display());
         return Ok(());
     }
 
@@ -216,7 +223,20 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     fs::copy(&paths.base_raw, &paths.configured_raw)?;
     resize(&paths.configured_raw, DISK_SIZE_GB)?;
 
-    run_vm(paths, &paths.configured_raw, Some(PROVISION_SCRIPT))?;
+    run_vm(
+        paths,
+        &paths.configured_raw,
+        vec![
+            LoginActions::WaitFor("login: ".to_string()),
+            LoginActions::Type("root\n".to_string()),
+            LoginActions::WaitFor("~#".to_string()),
+            LoginActions::Type({
+                let path = "provision.sh";
+                let script = PROVISION_SCRIPT;
+                format!("cat >{path} <<'PROVISIONING_EOF'\n{script}PROVISIONING_EOF\nsh {path}\n")
+            }),
+        ],
+    )?;
 
     Ok(())
 }
@@ -487,32 +507,29 @@ fn load_efi_variable_store(
     }
 }
 
-fn start_provisioning_thread(
-    script: &str,
+fn spawn_login_actions_thread(
+    login_actions: Vec<LoginActions>,
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<VmInput>,
 ) -> thread::JoinHandle<()> {
-    let script = script.to_string();
     thread::spawn(move || {
-        if WaitResult::Timeout == output_monitor.wait_for("login: ", Duration::from_secs(120)) {
-            eprintln!("Timed out waiting for system login prompt; not sending script.");
-            return;
-        }
-
-        let do_write = |payload: &str| {
-            if let Err(e) = input_tx.send(VmInput::Bytes(payload.as_bytes().to_vec())) {
-                eprintln!("Failed to write payload to VM serial: {}", e);
+        for a in login_actions {
+            match a {
+                LoginActions::WaitFor(text) => {
+                    if WaitResult::Timeout
+                        == output_monitor.wait_for(&text, Duration::from_secs(120))
+                    {
+                        eprintln!("Login action timed out waiting for '{}'", &text);
+                        return;
+                    }
+                }
+                LoginActions::Type(text) => {
+                    input_tx
+                        .send(VmInput::Bytes(text.into_bytes().to_vec()))
+                        .unwrap();
+                }
             }
-        };
-
-        do_write("root\n");
-
-        if WaitResult::Timeout == output_monitor.wait_for("~#", Duration::from_secs(120)) {
-            eprintln!("Timed out waiting for root shell; not sending script");
-            return;
         }
-        let path = "provisioning_script.sh";
-        do_write(&format!("cat >{path} <<'EOF'\n{script}EOF\nsh {path}\n"));
     })
 }
 
@@ -564,10 +581,15 @@ fn create_directory_share(
     }
 }
 
+enum LoginActions {
+    WaitFor(String),
+    Type(String),
+}
+
 fn run_vm(
     paths: &VmPaths,
     disk_path: &Path,
-    login_script: Option<&str>,
+    login_actions: Vec<LoginActions>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
@@ -626,8 +648,11 @@ fn run_vm(
     let output_monitor = Arc::new(OutputMonitor::new());
     let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
 
-    let provisioning_thread = login_script
-        .map(|s| start_provisioning_thread(s, output_monitor.clone(), io_ctx.input_tx.clone()));
+    let login_actions_thread = spawn_login_actions_thread(
+        login_actions,
+        output_monitor.clone(),
+        io_ctx.input_tx.clone(),
+    );
 
     let _raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
 
@@ -651,9 +676,7 @@ fn run_vm(
         }
     }
 
-    if let Some(handle) = provisioning_thread {
-        let _ = handle.join();
-    }
+    let _ = login_actions_thread.join();
 
     io_ctx.shutdown();
 
@@ -690,8 +713,10 @@ fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
 
     let original = attributes;
 
-    attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
-    attributes.c_lflag &= !((libc::ICANON | libc::ECHO) as libc::tcflag_t);
+    // Disable translation of carriage return to newline on input
+    attributes.c_iflag &= !(libc::ICRNL);
+    // Disable canonical mode (line buffering), echo, and signal generation
+    attributes.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
     attributes.c_cc[libc::VMIN] = 0;
     attributes.c_cc[libc::VTIME] = 1;
 

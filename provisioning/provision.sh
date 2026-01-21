@@ -13,6 +13,9 @@ apt-get install -y --no-install-recommends      \
 curl https://mise.run | sh
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
 
-echo 'systemctl poweroff' > .bash_logout
+cat > .bash_logout <<EOF
+systemctl poweroff
+sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+EOF
 
 systemctl poweroff
