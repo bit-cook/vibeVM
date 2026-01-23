@@ -1,148 +1,137 @@
+# Vibe
 
+Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
 
-
-## Distro flavors
-
-Debian 
-
-> generic: Should run in any environment using cloud-init, for e.g. OpenStack, DigitalOcean and also on bare metal.
-> genericcloud: Identical to generic but with a reduced set of hardware drivers in the kernel. If it does not work for your use case, you should use the generic images.
-> nocloud: Does not run cloud-init and boots directly to a root prompt. Useful for local VM instantiation with tools like QEMU.
-
-
-
-## Booting
-
-there are two ways to boot:
-
-1. From a disk image which contains bootloader.
-
-2. With a kernel (distributed as a compressed `vmlinuz` which needs to be decompressed first to run) and ramdisk (`initrd` --- "initial ram disk", I guess).
-Specifying these which allows for command line arguments to specify where to output boot logs
-
-"console=hvc0",
-
-
-## How can you configure a VM?
-
-I'm familiar with three ways of automated VM configuration:
-
-### SSH
-
-If the downloaded image is configured to automatically set up networking and start and SSH server, you can just keep trying to login, then run your provisioning commands:
-
-```sh
-
-# SSH args to disable noise about keys and stuff
-SSH_ARGS="-o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -p $SSH_PORT"
-
-until ssh $SSH_ARGS -o ConnectTimeout=1 user@vm-address true 2>/dev/null; do
-    echo -n "."
-    sleep 1
-done
-
-ssh $SSH_ARGS user@vm-address 'bash -s' <<EOF
-  # provisioning commands go here
-EOF
+```
+cd my-project/
+vibe
+# wait ~5 seconds
+# you are now in a Linux VM, which has shared access to your my-project/ folder
 ```
 
-However, none of Debian's official images have SSH and a default username/password, so I couldn't use this approach.
+Dependencies:
+
+- An M-series Mac running MacOS 13 (Ventura) or higher.
+- A network connection is required on the first run to download and configure the Debian Linux base image.
+- That's it!
 
 
+## Install
 
-### Cloud-init
+Vibe is a single binary, so it's easy to install.
 
-Here you put configuration data in YAML files, put those into a disk image, then mount this disk image to the VM, which uses it on first boot to configure itself.
-For example, here's setting up a new user named `user` with no password
+If you use the excellent [mise-en-place](https://mise.jdx.dev/), it can download the pre-complied binary from Github for you:
 
-```sh
-mkdir -p cidata
+    mise use github:lynaghk/vibe@latest
+    
+Or you can grab the binary yourself and put it on your `$PATH`.
 
-cat > cidata/meta-data << 'EOF'
-instance-id: debian-vm
-local-hostname: debian
-EOF
+Alternatively, if you want to modify it for your own needs, all you need is a Rust toolchain:
 
-cat > cidata/user-data << 'EOF'
-#cloud-config
-users:
-  - name: user
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: false
-ssh_pwauth: true
-runcmd:
-  - sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
-  - passwd -d user
-  - systemctl restart sshd
-EOF
-
-hdiutil makehybrid -o seed.img -iso -joliet -default-volume-name cidata cidata/ > /dev/null 2>&1
-rm -rf cidata
-```
-
-Originally I steered away from cloud-init because it seemed complicated.
-In particular, when I booted some Ubuntu VMs they tried to make all sorts of network requests to possible remote configuration servers (which I wasn't running).
-
-There was also `systemd-networkd-wait-online.service` which blocks booting until it times out after 2.5 minutes, but only when my host machine was on a VPN.
-(This one took me quite a while to figure out!)
-
-Overall this didn't spark joy and felt too heavy, so I decided to go old schhool.
-
-### Console
-
-The other approach I explored was using the Debian `nocloud` image, which boots very quickly (no cloud-init stuff!) and allows login via `root` without a password.
-
-Automating this is tricky because the host has to wait until the VM is booted and waiting at the login prompt.
-
-There's some juggling of file descriptors here, since you want:
-
-1. the VM's console wired up to the terminal (so you can see output and type stuff)
-2. the automated provisioning to *also* be able to see output and "type" stuff.
+    git clone ssh://git@github.com:lynaghk/vibe
+    cd vibe
+    cargo install
 
 
-But the idea is to have the provisioning system wait until it sees the VM's output end with `login:`, and then it should duplicate the console input file descriptor so that it can also write some stuff there:
-```rust
-let dup_fd = libc::dup(console_stdin);
-if dup_fd < 0 {
-    eprintln!("Failed to dup fd: {}", io::Error::last_os_error());
-    return;
-}
-let mut stdin = File::from_raw_fd(dup_fd);
+## Command reference
 
-let mut do_write = |payload: &str| {
-    if let Err(e) = stdin.write_all(payload.as_bytes()) {
-        eprintln!("Failed to write payload to VM serial: {}", e);
-    }
-    let _ = stdin.flush();
-};
 
-// first login, waiting a bit for the VM's prompt to come up (timeout works fine, but ideally this would wait for expected prompt characters to show up)
-do_write("root\n");
-std::thread::sleep(Duration::from_millis(500));
+vibe --expand
 
-// write in the provisioning script and run it
-do_write(&format!(
-    "cat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
-));
-```
+vibe configure provisioning-bash-script.sh
+
+vibe --mount host-path:guest-path
+
+if `host-path` doesn't exist, it will be created.
+
+--no-default-mounts
+--no-mask-git
 
 
 
 
-## Other learnings
+--mount 
 
-Apple's filesystem supports sparse files, so resizing a file:
 
-```rust
-let file = fs::OpenOptions::new().write(true).open(path)?;
-file.set_len(size_bytes)?;
-```
 
-won't actually consume any disk space until the new parts of the file are written to.
-You can run `ls -lsh some-file` to see the used 512-byte blocks (first column) compared to the allocated space.
-For example, this file is sized as 10GB but only uses about 2_382_272 × 512 byte = 1.22 GB on disk.
 
-    2382272 -rw-r--r--@ 1 klynagh  staff    10G Jan 15 22:08 some-file
 
-You can also use `du -h some-file` to show actual disk usage in human readable output `1.2G some-file`
+## How it works
+
+The first time you run `vibe` on your computer, a Debian Linux image is downloaded to `~/.cache/vibe/` and configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
+(See `/src/provision.sh` for details.)
+
+Then, when you run `vibe` in a project directory, it makes a copy of this configured image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
+When you `exit` this shell, the VM is shutdown.
+The VM disk persists in the `.vibe` folder.
+
+The VM disks are 10 GB, but because Apple Filesystem is copy-on-write, disk space is only actually consumed when new data is written.
+You can use `du -h` to see how much space is actually consumed:
+
+    $ ls -lah .vibe/
+    Permissions Size User Date Modified Name
+    .rw-r--r--   11G dev  18 Jan 12:52   instance.raw
+
+    $ du -h .vibe/instance.raw
+    1.2G    .vibe/instance.raw
+    
+
+Other tricks:
+
+- MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
+
+
+
+## Alternatives
+
+I started this project in 2026 Jan after I noticed OpenAI's codex agent reading files outside of the folder I'd started it in (not cool, bro!).
+Here's what I tried before writing this solution:
+
+- [Sandboxtron](https://github.com/lynaghk/sandboxtron/) - My own little wrapper around Mac's `sandbox-exec`.
+Turns out both Claude Code and Codex rely on this as well, and MacOS doesn't allow creating a sandbox from within a sandbox.
+I considered writing my own sandboxing rules and running the agents `--yolo`, but didn't like the risk of configuration typos and/or Mac sandbox escapes (there are a lot --- I'm not an expert, but from [this HN discussion](https://news.ycombinator.com/item?id=42084588) I figured virtualization would be safer).
+- [Lima](https://github.com/lima-vm/lima/), quick Linux VMs on Mac. I wanted to like this, ran into too many issues in first 30 minutes to trust it:
+  - The recommended Debian image took 8 seconds to get to a login prompt, even after the VM was already running.
+  - The CLI flags *mutate hidden state*. E.g., If you `limactl start --mount foo` and then later `limactl start --mount bar`, both `foo` and `bar` will be mounted.
+  - Some capabilities are only available via yaml. E.g., the `--mount` CLI flag always mounts at the same path in the guest. If you want to mount at a different path, you have to do that via YAML.
+  - There's some kind of inheritance happening so even if you do write YAML, you can't see the full configuration.
+  
+- [Vagrant](https://developer.hashicorp.com/vagrant/) - I fondly remember using this back in the early 2010's, but based on this [2025 Reddit discussion](https://www.reddit.com/r/devops/comments/1axws75/vagrant_doesnt_support_mac_m1/) it seemed like running it on an ARM-based Mac was A Project and so I figured it'd be easier to roll my own thing.
+
+- [Tart](https://tart.run/) - I found this via some positive HN comments, but unfortunately wasn't able to run the release binary from their GitHub because it's not signed.
+They apparently hack around that when installing with homebrew, but I don't use homebrew either.
+I tried cloning the repo and compiling myself, but the build failed with lots of language syntax errors despite the repo SHA is the same as one of their releases.
+I assume this is a Swift problem and not Tart's, since this sort of mess happens most times when I try to build Swift. `¯\_(ツ)_/¯`
+
+- [OrbStack](https://orbstack.dev/) - This looked nice, but seems mostly geared towards container stuff.
+It runs a single VM, and I couldn't figure out how to have this VM run *without* my entire disk mounted inside of it.
+I didn't want to run agents via containers, since containers aren't security boundaries.
+
+- [Apple Container Framework](https://github.com/apple/container) - This looks technically promising, as it runs every container within a lightweight VM.
+Unfortunately it requires MacOS 26 Tahoe, which wrecks [window resizing](https://news.ycombinator.com/item?id=46579864), adds [useless icons everywhere](https://news.ycombinator.com/item?id=46497712), and otherwise seems to be a mess.
+Sorry excellent Apple programmers and hardware designers, I hope your management can reign in the haute couture folks before we all have to switch to Linux for professional computing.
+
+- [QEMU](https://wiki.qemu.org/) - The first prototype of this app was a single bash script wrapping `qemu`. This worked swimmingly, except for host/guest folder sharing, which ended up being a show-stopper. This is because QEMU doesn't support [virtiofs](https://virtio-fs.gitlab.io/) on Mac hosts, it only supports "9p", which is way slower ---  e.g., `mise use node@latest` takes > 10 minutes on 9p and 5 seconds on virtiofs.
+
+
+## Roadmap / Collaboration
+
+I wrote this software for myself, and I'm open to pull requests and otherwise collaborating on features that I'd personally use:
+
+- forwarding ports from the host to a guest
+- running `vibe` in a folder that already has a vibe VM running should connect to the already-running VM
+  - the VM shouldn't shutdown until all host terminals have logged out
+- if not the above, at least a check and nice error message when you try to start a VM that's already running.
+- a way to make faster-booting even more minimal Linux virtual machines
+  - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
+
+
+I'm not sure about (but open to discussing proposals via GitHub issues):
+
+- the ability to run VMs in the background
+- the ability to script VMs
+
+I'm not interested in:
+
+- anything related to Docker / containers / Kubernetes / distributed systems
+- supporting other host or guest operating systems
