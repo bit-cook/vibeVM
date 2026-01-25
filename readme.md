@@ -11,7 +11,7 @@ vibe
 
 Dependencies:
 
-- An M-series Mac running MacOS 13 (Ventura) or higher.
+- An ARM-based Mac running MacOS 13 (Ventura) or higher.
 - A network connection is required on the first run to download and configure the Debian Linux base image.
 - That's it!
 
@@ -33,53 +33,57 @@ Alternatively, if you want to modify it for your own needs, all you need is a Ru
     cargo install
 
 
-## How it works
-
-The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/` and configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
-(See `/src/provision.sh` for details.)
-
-When you run `vibe` in a project directory, it makes a copy of this configured image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
-When you `exit` this shell, the VM is shutdown.
-The disk state persists until you delete it.
-
-There is no centralized registry of disk images --- if you want to delete a VM, just delete its `.vibe` directory.
-
-The VM disks are 10 GB, but because Apple Filesystem is copy-on-write, disk space is only actually consumed when new data is written.
-You can use `du -h` to see how much space is actually consumed:
-
-    $ ls -lah .vibe/
-    Permissions Size User Date Modified Name
-    .rw-r--r--   11G dev  18 Jan 12:52   instance.raw
-
-    $ du -h .vibe/instance.raw
-    1.2G    .vibe/instance.raw
-    
-
-Other tricks:
-
-- MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
-
-
 ## Using Vibe
 
 Vibe can be invoked in several ways:
 
-- `vibe` is the "do what I mean" default invocation described above.
+- `vibe` is the "do what I mean" default invocation.
+  The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/` and configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
+  When you run `vibe` in a project directory, it copies this configured image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
 
-- `vibe run path/to/disk.raw` is an explicit mode where the VM disk image must already exist, all mounts must be specified, and all login commands must be specified.
-  Your shell will be attached to the VM until you log out of it, after which the VM will be shutdown.
+  When you `exit` this shell, the VM is shutdown.
+  The disk state persists until you delete it.
+  There is no centralized registry of VMs--- if you want to delete a VM, just delete its disk image file.
 
-- `vibe plan` prints the shell commands that would be invoked if you typed `vibe`.
+- `vibe plan` prints the shell commands that would be invoked by `vibe`.
 
-- `vibe show [built-in-file.sh]` prints the contents of a default shell script built into the binary. If no argument is given, a list of all built-in scripts will be returned.
+- `vibe run disk.raw` is an explicit mode where the VM disk image must already exist, all mounts must be specified, and all login commands must be specified.
+
+- `vibe show [built-in-file.sh]` prints the contents of a default shell script built into the binary.
+   If no argument is given, a list of all built-in scripts will be returned.
 
 
 The best way to understand how vibe works is to run `vibe plan`:
 
-TODO EXAMPLE HERE
+    $ vibe plan
+
+    SHA=e4992939b0aacc98a0f23f50b196259e336b699369323630ba0e4def71c20cec395478c9da9202694314c55a99457dc1e5a1e29a3afd85aa07ae92faf3044d95
+
+    mkdir -p ~/.cache/vibe/                                                                                        &&
+    curl                                                              \
+      --compressed                                                    \
+      --location                                                      \
+      --fail                                                          \
+      -o ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.tar.xz   \
+      https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz      &&
+
+    echo "$SHA  ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw" | /usr/bin/shasum --algorithm 512 --check &&
+
+    tar -xOf                                                          \
+      ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.tar.xz      \
+      ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw                                                      &&
+
+
+    vibe run ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw  \
+      --mount ~/.cache/vibe/.guest-mise-cache:/root/.local/share/mise \
+      --wait "login: "                                                \
+      --send "root"                                                   \
+      --wait "# "                                                     \
+      --script <(vibe show provision.sh)
+      
+    [... TODO, replace this with actual vibe plan output ]      
 
 You can build your own workflows on top of vibe by saving these commands in your own wrapper shell scripts.
-
 
 ## Command reference
 
@@ -87,31 +91,29 @@ The following flags apply to `vibe` and `vibe run`.
 All flags can be specified as many times as desired.
 
 - `--mount host-path:guest-path[:read-only | :read-write]` mount `host-path` inside VM at `guest-path`.
-  Defaults to read-write unless otherwise specified.
-  If `host-path` doesn't exist, it will be created.
-- `--script filename.sh` run script in VM after logging in.
-- `--expect string` wait for `string` to appear.
-- `--send some-command` type `some-command` followed by a newline on the VM.
-- `--mask guest-path` Mask the provided path within the guest.
-  This is useful for preventing an agent from accidentally reading/writing to a subpath of a shared directory (e.g., `.git/`).
-  Fails silently if the guest path doesn't exist.
-  Note that this is NOT secure, as the VM root user can unmount the tempfs masking the subpath.
-  This is equivalent to `--eval 'mount -t tmpfs tmpfs guest-path'`.
-  (If you have more secure ideas for how to exclude specific files/folders from a directory mount, I'd love it hear it!)
-```
+  Suffix defaults to `:read-write`.
+  If a host-path does not exist, an error will be thrown.
+
+- `--script filename.sh` run script in VM.
+
+- `--expect string [timeout-seconds]` wait for `string` to appear in console output before executing next `--script` or `--send`.
+  Optional timeout defaults to `30`.
+
+- `--send some-command` type `some-command` followed by a newline into the VM.
 
 
-The core functionality of `vibe` is to:
+## Other notes
 
-- run a virtual machine using Apple's Virtualization Framework
-- wire up this VM's console to your terminal
-- maybe inject some commands into this console
+- The VM disks are 10 GB, but because Apple Filesystem is copy-on-write, disk space is only actually consumed when new data is written.
+  You can use `du -h` to see how much space is actually consumed:
 
+      $ /bin/ls -lah .vibe/instance.raw
+      -rw-r--r--  1 dev  staff    10G Jan 25 20:41 .vibe/instance.raw
 
-to expand all default flags and arguments, so you can see exactly what's going to happen.
-Note that output may vary depending on `~/.cache/vibe` and `.vibe` relative directory.
+      $ du -h .vibe/instance.raw
+      2.3G    .vibe/instance.raw
 
-
+- MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
 
 
 ## Alternatives
@@ -152,19 +154,19 @@ Sorry excellent Apple programmers and hardware designers, I hope your management
 I wrote this software for myself, and I'm open to pull requests and otherwise collaborating on features that I'd personally use:
 
 - forwarding ports from the host to a guest
-- running `vibe` in a directory that already has a vibe VM running should connect to the already-running VM
+- running `vibe` against a disk image that's already running should connect to the already-running VM
   - the VM shouldn't shutdown until all host terminals have logged out
 - if not the above, at least a check and nice error message when you try to start a VM that's already running.
 - a way to make faster-booting even more minimal Linux virtual machines
   - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
-- propagate an exit code to the `vibe` command when exiting a vm
+- propagate an exit code from within VM to the `vibe` command
+- CPU core / memory / networking configuration via extended attributes on the disk image file
 
 I'm not sure about (but open to discussing proposals via GitHub issues):
 
-- the ability to run VMs in the background
-- the ability to script VMs
+- running VMs in the background
 
 I'm not interested in:
 
 - anything related to Docker / containers / Kubernetes / distributed systems
-- supporting other host or guest operating systems
+- complex changes to support operating system hosts besides MacOS or guests besides Linux

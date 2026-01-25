@@ -24,6 +24,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
+//TODO: echo "e4992939b0aacc98a0f23f50b196259e336b699369323630ba0e4def71c20cec395478c9da9202694314c55a99457dc1e5a1e29a3afd85aa07ae92faf3044d95  /Users/dev/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw" | /usr/bin/shasum --algorithm 512 --check
 const DEBIAN_DISK_URL: &str =
     "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
 const SHARED_DIRECTORIES_TAG: &str = "shared";
@@ -253,6 +254,7 @@ chmod +x {path}
 ./{path}"
             )
         })],
+        //TODO: need to mount shared mise directory during provisioning so node, etc. are downloaded to host cache rather than to VM image
         &[],
     )?;
 
