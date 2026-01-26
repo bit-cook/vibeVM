@@ -7,11 +7,10 @@ use std::{
         process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -24,9 +23,9 @@ use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
-//TODO: echo "e4992939b0aacc98a0f23f50b196259e336b699369323630ba0e4def71c20cec395478c9da9202694314c55a99457dc1e5a1e29a3afd85aa07ae92faf3044d95  /Users/dev/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw" | /usr/bin/shasum --algorithm 512 --check
-const DEBIAN_DISK_URL: &str =
+const DEBIAN_COMPRESSED_DISK_URL: &str =
     "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
+const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const DISK_SIZE_GB: u64 = 10;
@@ -48,6 +47,20 @@ struct DirectoryShare {
 }
 
 impl DirectoryShare {
+    fn new(host: PathBuf, guest: PathBuf, read_only: bool) -> Result<Self, std::io::Error> {
+        if !host.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Host path does not exist: {}", host.display()),
+            ));
+        }
+        Ok(Self {
+            host,
+            guest,
+            read_only,
+        })
+    }
+
     fn tag(&self) -> String {
         let path_str = self.host.to_string_lossy();
         let hash = path_str
@@ -77,29 +90,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| home.join(".cache"));
     let cache_dir = cache_home.join("vibe");
     let guest_mise_cache = cache_dir.join(".guest-mise-cache");
+
     let instance_dir = project_root.join(".vibe");
 
-    let basename_compressed = DEBIAN_DISK_URL.rsplit('/').next().unwrap();
+    let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
     let base_compressed = cache_dir.join(basename_compressed);
     let base_raw = cache_dir.join(format!(
         "{}.raw",
         basename_compressed.trim_end_matches(".tar.xz")
     ));
 
-    let configured_raw = cache_dir.join("configured_base.raw");
+    let default_raw = cache_dir.join("default.raw");
     let instance_raw = instance_dir.join("instance.raw");
-    let cargo_registry = home.join(".cargo/registry");
 
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
     fs::create_dir_all(&guest_mise_cache)?;
 
-    // TODO: would be nice to have this called by ensure_configured, rather than having it in main.
-    ensure_base_image(&base_raw, &base_compressed)?;
+    let mise_directory_share =
+        DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
-    ensure_configured_base(&base_raw, &configured_raw)?;
+    ensure_default_image(
+        &base_raw,
+        &base_compressed,
+        &default_raw,
+        std::slice::from_ref(&mise_directory_share),
+    )?;
 
-    ensure_instance_disk(&instance_raw, &configured_raw)?;
+    ensure_instance_disk(&instance_raw, &default_raw)?;
 
     let mut login_actions = vec![Type(format!("cd {project_name}"))];
 
@@ -107,38 +125,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     login_actions.push(Type("clear".into()));
 
     // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
-    // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system, and
+    // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system
     if project_root.join(".git").exists() {
         login_actions.push(Type(r"mount -t tmpfs tmpfs .git/".into()));
     }
 
     let mut directory_shares = vec![
-        DirectoryShare {
-            host: cargo_registry,
-            guest: "/root/.cargo/registry".into(),
-            read_only: false,
-        },
-        DirectoryShare {
-            host: guest_mise_cache,
-            guest: "/root/.local/share/mise".into(),
-            read_only: false,
-        },
-        DirectoryShare {
-            guest: PathBuf::from("/root/").join(project_name),
-            host: project_root,
-            read_only: false,
-        },
+        mise_directory_share,
+        DirectoryShare::new(
+            project_root,
+            PathBuf::from("/root/").join(project_name),
+            false,
+        )
+        .expect("Project directory must exist"),
     ];
 
+    // Add default shares, if they exist
+    for share in [
+        DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+        DirectoryShare::new(
+            home.join(".cargo/registry"),
+            "/root/.cargo/registry".into(),
+            false,
+        ),
+        DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+    ]
+    .into_iter()
+    .flatten()
     {
-        let codex = home.join(".codex");
-        if codex.exists() {
-            directory_shares.push(DirectoryShare {
-                guest: PathBuf::from("/root/").join(".codex"),
-                host: codex,
-                read_only: false,
-            })
-        }
+        directory_shares.push(share)
     }
 
     run_vm(&instance_raw, &login_actions, &directory_shares[..])
@@ -199,20 +214,44 @@ fn ensure_base_image(
         return Ok(());
     }
 
-    println!("Downloading base image...");
-    let status = Command::new("curl")
-        .args([
-            "--compressed",
-            "--location",
-            "--fail",
-            "-o",
-            &base_compressed.to_string_lossy(),
-            DEBIAN_DISK_URL,
-        ])
-        .status()?;
+    if !base_compressed.exists() {
+        println!("Downloading base image...");
+        let status = Command::new("curl")
+            .args([
+                "--compressed",
+                "--location",
+                "--fail",
+                "-o",
+                &base_compressed.to_string_lossy(),
+                DEBIAN_COMPRESSED_DISK_URL,
+            ])
+            .status()?;
+        if !status.success() {
+            return Err("Failed to download base image".into());
+        }
+    }
 
-    if !status.success() {
-        return Err("Failed to download base image".into());
+    // Check SHA
+    {
+        let input = format!("{}  {}\n", DEBIAN_COMPRESSED_SHA, base_compressed.display());
+
+        let mut child = Command::new("/usr/bin/shasum")
+            .args(["--algorithm", "512", "--check"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn shasum");
+
+        child
+            .stdin
+            .take()
+            .expect("failed to open stdin")
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
+
+        let status = child.wait().expect("failed to wait on child");
+        if !status.success() {
+            return Err(format!("SHA validation failed for {DEBIAN_COMPRESSED_DISK_URL}").into());
+        }
     }
 
     println!("Decompressing base image...");
@@ -228,21 +267,24 @@ fn ensure_base_image(
     Ok(())
 }
 
-fn ensure_configured_base(
+fn ensure_default_image(
     base_raw: &Path,
-    configured_raw: &Path,
+    base_compressed: &Path,
+    default_raw: &Path,
+    directory_shares: &[DirectoryShare],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if configured_raw.exists() {
-        println!("Using configured base at {}", configured_raw.display());
+    if default_raw.exists() {
         return Ok(());
     }
 
+    ensure_base_image(base_raw, base_compressed)?;
+
     println!("Configuring base image...");
-    fs::copy(base_raw, configured_raw)?;
-    resize(configured_raw, DISK_SIZE_GB)?;
+    fs::copy(base_raw, default_raw)?;
+    resize(default_raw, DISK_SIZE_GB)?;
 
     run_vm(
-        configured_raw,
+        default_raw,
         &[Type({
             let path = "provision.sh";
             let script = include_str!("provision.sh");
@@ -254,8 +296,7 @@ chmod +x {path}
 ./{path}"
             )
         })],
-        //TODO: need to mount shared mise directory during provisioning so node, etc. are downloaded to host cache rather than to VM image
-        &[],
+        directory_shares,
     )?;
 
     Ok(())
@@ -263,15 +304,15 @@ chmod +x {path}
 
 fn ensure_instance_disk(
     instance_raw: &Path,
-    configured_raw: &Path,
+    template_raw: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if instance_raw.exists() {
         return Ok(());
     }
 
-    println!("Creating instance disk from configured base image...");
+    println!("Creating instance disk from {}...", template_raw.display());
     std::fs::create_dir_all(instance_raw.parent().unwrap())?;
-    fs::copy(configured_raw, instance_raw)?;
+    fs::copy(template_raw, instance_raw)?;
     resize(instance_raw, DISK_SIZE_GB)?;
     Ok(())
 }
