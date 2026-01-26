@@ -121,14 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut login_actions = vec![Type(format!("cd {project_name}"))];
 
-    // TODO: Add a nice entry message which shows the shared directories.
-    login_actions.push(Type("clear".into()));
-
     // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
     // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system
     if project_root.join(".git").exists() {
         login_actions.push(Type(r"mount -t tmpfs tmpfs .git/".into()));
     }
+
+    // TODO: Add a nice entry message which shows the shared directories.
+    login_actions.push(Type("clear".into()));
 
     let mut directory_shares = vec![
         mise_directory_share,
