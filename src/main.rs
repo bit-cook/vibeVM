@@ -18,28 +18,33 @@ use std::{
 };
 
 use block2::RcBlock;
+use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as ClapCommand};
 use dispatch2::DispatchQueue;
 use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
-const DEBIAN_COMPRESSED_DISK_URL: &str =
-    "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
+const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
 const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
-const DISK_SIZE_GB: u64 = 10;
+const DISK_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
+const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
+const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 
 #[derive(Clone)]
-enum LoginActions {
-    WaitFor(String),
-    Type(String),
+enum LoginAction {
+    Expect { text: String, timeout: Duration },
+    Send(String),
+    Script { path: PathBuf, index: usize },
 }
-use LoginActions::*;
+use LoginAction::*;
 
+#[derive(Clone)]
 struct DirectoryShare {
     host: PathBuf,
     guest: PathBuf,
@@ -47,18 +52,47 @@ struct DirectoryShare {
 }
 
 impl DirectoryShare {
-    fn new(host: PathBuf, guest: PathBuf, read_only: bool) -> Result<Self, std::io::Error> {
+    fn new(
+        host: PathBuf,
+        mut guest: PathBuf,
+        read_only: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if !host.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Host path does not exist: {}", host.display()),
-            ));
+            return Err(format!("Host path does not exist: {}", host.display()).into());
+        }
+        if !guest.is_absolute() {
+            guest = PathBuf::from("/root").join(guest);
         }
         Ok(Self {
             host,
             guest,
             read_only,
         })
+    }
+
+    fn from_mount_spec(spec: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 {
+            return Err(format!("Invalid mount spec: {spec}").into());
+        }
+        let host = PathBuf::from(parts[0]);
+        let guest = PathBuf::from(parts[1]);
+        let read_only = if parts.len() == 3 {
+            match parts[2] {
+                "read-only" => true,
+                "read-write" => false,
+                _ => {
+                    return Err(format!(
+                        "Invalid mount mode '{}'; expected read-only or read-write",
+                        parts[2]
+                    )
+                    .into());
+                }
+            }
+        } else {
+            false
+        };
+        DirectoryShare::new(host, guest, read_only)
     }
 
     fn tag(&self) -> String {
@@ -76,7 +110,15 @@ impl DirectoryShare {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let matches = build_cli().get_matches();
+
+    if let Some(("show", sub_matches)) = matches.subcommand() {
+        let name = sub_matches.get_one::<String>("builtin").map(String::as_str);
+        return show_builtin_script(name);
+    }
+
     ensure_signed();
+
     let project_root = env::current_dir()?;
     let project_name = project_root
         .file_name()
@@ -110,53 +152,305 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
-    ensure_default_image(
-        &base_raw,
-        &base_compressed,
-        &default_raw,
-        std::slice::from_ref(&mise_directory_share),
-    )?;
+    let disk_path = if let Some(path) = matches.get_one::<PathBuf>("disk").cloned() {
+        if !path.exists() {
+            return Err(format!("Disk image does not exist: {}", path.display()).into());
+        }
+        path
+    } else {
+        ensure_default_image(
+            &base_raw,
+            &base_compressed,
+            &default_raw,
+            std::slice::from_ref(&mise_directory_share),
+        )?;
+        ensure_instance_disk(&instance_raw, &default_raw)?;
 
-    ensure_instance_disk(&instance_raw, &default_raw)?;
+        instance_raw
+    };
 
-    let mut login_actions = vec![Type(format!("cd {project_name}"))];
+    let mut login_actions = Vec::new();
+    let mut directory_shares = Vec::new();
 
-    // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
-    // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system
-    if project_root.join(".git").exists() {
-        login_actions.push(Type(r"mount -t tmpfs tmpfs .git/".into()));
+    if !matches.get_flag("no-default-mounts") {
+        login_actions.push(Send(format!("cd {project_name}")));
+
+        // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
+        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system
+        if project_root.join(".git").exists() {
+            login_actions.push(Send(r"mount -t tmpfs tmpfs .git/".into()));
+        }
+
+        directory_shares.push(mise_directory_share);
+        directory_shares.push(
+            DirectoryShare::new(
+                project_root,
+                PathBuf::from("/root/").join(project_name),
+                false,
+            )
+            .expect("Project directory must exist"),
+        );
+
+        // Add default shares, if they exist
+        for share in [
+            DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+            DirectoryShare::new(
+                home.join(".cargo/registry"),
+                "/root/.cargo/registry".into(),
+                false,
+            ),
+            DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            directory_shares.push(share)
+        }
     }
 
-    // TODO: Add a nice entry message which shows the shared directories.
-    login_actions.push(Type("clear".into()));
+    login_actions.extend(collect_ordered_actions(&matches)?);
 
-    let mut directory_shares = vec![
-        mise_directory_share,
-        DirectoryShare::new(
-            project_root,
-            PathBuf::from("/root/").join(project_name),
-            false,
+    if let Some(mounts) = matches.get_many::<String>("mount") {
+        for spec in mounts {
+            directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+        }
+    }
+
+    if let Some(motd_action) = motd_login_action(&directory_shares) {
+        login_actions.push(motd_action);
+    }
+
+    run_vm(&disk_path, &login_actions, &directory_shares[..])
+}
+
+fn build_cli() -> ClapCommand {
+    ClapCommand::new("vibe")
+        .arg(
+            Arg::new("disk")
+                .value_name("DISK")
+                .value_parser(value_parser!(PathBuf)),
         )
-        .expect("Project directory must exist"),
-    ];
+        .arg(
+            Arg::new("no-default-mounts")
+                .long("no-default-mounts")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("mount")
+                .long("mount")
+                .action(ArgAction::Append)
+                .value_name("host-path:guest-path[:read-only|:read-write]")
+                .value_parser(value_parser!(String)),
+        )
+        .arg(
+            Arg::new("script")
+                .long("script")
+                .action(ArgAction::Append)
+                .value_name("FILE")
+                .value_parser(value_parser!(String)),
+        )
+        .arg(
+            Arg::new("send")
+                .long("send")
+                .action(ArgAction::Append)
+                .value_name("COMMAND")
+                .value_parser(value_parser!(String)),
+        )
+        .arg(
+            Arg::new("expect")
+                .long("expect")
+                .action(ArgAction::Append)
+                .num_args(1..=2)
+                .value_names(["STRING", "TIMEOUT"])
+                .value_parser(value_parser!(String)),
+        )
+        .subcommand(
+            ClapCommand::new("show").arg(
+                Arg::new("builtin")
+                    .help("List built-in scripts or show the contents of the provided script name.")
+                    .value_name("BUILTIN")
+                    .value_parser(value_parser!(String)),
+            ),
+        )
+}
 
-    // Add default shares, if they exist
-    for share in [
-        DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
-        DirectoryShare::new(
-            home.join(".cargo/registry"),
-            "/root/.cargo/registry".into(),
-            false,
-        ),
-        DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        directory_shares.push(share)
+fn show_builtin_script(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let builtins = [("provision.sh", PROVISION_SCRIPT)];
+    match name {
+        Some(requested) => {
+            if let Some((_, content)) = builtins.iter().find(|(n, _)| *n == requested) {
+                print!("{content}");
+                Ok(())
+            } else {
+                Err(format!("Unknown built-in file: {requested}").into())
+            }
+        }
+        None => {
+            for (name, _) in builtins {
+                println!("{name}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn collect_ordered_actions(
+    matches: &ArgMatches,
+) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
+    let mut ordered: Vec<(usize, LoginAction)> = Vec::new();
+
+    for (index, values) in collect_occurrences_with_indices(matches, "script") {
+        let [path] = values.as_slice() else {
+            return Err("--script expects exactly one value".into());
+        };
+        ordered.push((
+            index,
+            Script {
+                path: path.into(),
+                index,
+            },
+        ));
     }
 
-    run_vm(&instance_raw, &login_actions, &directory_shares[..])
+    for (index, values) in collect_occurrences_with_indices(matches, "send") {
+        let [text] = values.as_slice() else {
+            return Err("--send expects exactly one value".into());
+        };
+        ordered.push((index, Send(text.clone())));
+    }
+
+    for (index, values) in collect_occurrences_with_indices(matches, "expect") {
+        let (text, timeout) = match values.as_slice() {
+            [t] => (t.clone(), DEFAULT_EXPECT_TIMEOUT),
+            [t, secs] => (t.clone(), Duration::from_secs(secs.parse()?)),
+            _ => return Err("--expect expects a string and an optional timeout in seconds".into()),
+        };
+        ordered.push((index, Expect { text, timeout }));
+    }
+
+    ordered.sort_by_key(|(i, _)| *i);
+    Ok(ordered.into_iter().map(|(_, a)| a).collect())
+}
+
+fn collect_occurrences_with_indices(matches: &ArgMatches, id: &str) -> Vec<(usize, Vec<String>)> {
+    let occurrences: Vec<Vec<String>> = matches
+        .get_occurrences::<String>(id)
+        .map(|occ| {
+            occ.map(|values| values.map(|v| v.to_string()).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut indices = matches.indices_of(id).unwrap_or_default();
+    let mut out = Vec::with_capacity(occurrences.len());
+    for values in occurrences {
+        let mut first_index = None;
+        for _ in 0..values.len() {
+            let idx = indices
+                .next()
+                .ok_or_else(|| format!("Missing indices for argument {id}"))
+                .unwrap();
+            if first_index.is_none() {
+                first_index = Some(idx);
+            }
+        }
+        out.push((first_index.unwrap(), values));
+    }
+
+    out
+}
+
+fn script_command_from_path(
+    path: &Path,
+    index: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let script = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read script {}: {err}", path.display()))?;
+    let label = format!("{}_{}", index, path.file_name().unwrap().display());
+    script_command_from_content(&label, &script)
+}
+
+fn script_command_from_content(
+    label: &str,
+    script: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let marker = "VIBE_SCRIPT_EOF";
+    let guest_dir = "/tmp/vibe-scripts";
+    let guest_path = format!("{guest_dir}/{label}.sh");
+    let command = format!(
+        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
+    );
+    if script.contains(marker) {
+        return Err(
+            format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
+        );
+    }
+    Ok(command)
+}
+
+fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
+    if directory_shares.is_empty() {
+        return Some(Send("clear".into()));
+    }
+
+    let host_header = "Host";
+    let guest_header = "Guest";
+    let mode_header = "Mode";
+    let mut host_width = host_header.len();
+    let mut guest_width = guest_header.len();
+    let mut mode_width = mode_header.len();
+    let mut rows = Vec::with_capacity(directory_shares.len());
+
+    for share in directory_shares {
+        let host = share.host.to_string_lossy().into_owned();
+        let guest = share.guest.to_string_lossy().into_owned();
+        let mode = if share.read_only {
+            "read-only"
+        } else {
+            "read-write"
+        }
+        .to_string();
+        host_width = host_width.max(host.len());
+        guest_width = guest_width.max(guest.len());
+        mode_width = mode_width.max(mode.len());
+        rows.push((host, guest, mode));
+    }
+
+    let mut output = String::new();
+    output.push_str(
+        "
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░ 
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓██████▓▒░   
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
+   ░▒▓██▓▒░  ░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
+
+",
+    );
+    output.push_str(&format!(
+        "{host_header:<host_width$}  {guest_header:<guest_width$}  {mode_header}\n",
+        host_width = host_width
+    ));
+    output.push_str(&format!(
+        "{:-<host_width$}  {:-<guest_width$}  {:-<mode_width$}\n",
+        "",
+        "",
+        "",
+        host_width = host_width,
+        guest_width = guest_width,
+        mode_width = mode_width
+    ));
+
+    for (host, guest, mode) in rows {
+        output.push_str(&format!(
+            "{host:<host_width$}  {guest:<guest_width$}  {mode}\n"
+        ));
+    }
+
+    let command = format!("clear && cat <<'VIBE_MOTD'\n{output}VIBE_MOTD\n");
+    Some(Send(command))
 }
 
 #[derive(PartialEq, Eq)]
@@ -281,23 +575,10 @@ fn ensure_default_image(
 
     println!("Configuring base image...");
     fs::copy(base_raw, default_raw)?;
-    resize(default_raw, DISK_SIZE_GB)?;
+    resize(default_raw, DISK_SIZE_BYTES)?;
 
-    run_vm(
-        default_raw,
-        &[Type({
-            let path = "provision.sh";
-            let script = include_str!("provision.sh");
-            format!(
-                "cat >{path} <<'PROVISIONING_EOF'
-{script}
-PROVISIONING_EOF
-chmod +x {path}
-./{path}"
-            )
-        })],
-        directory_shares,
-    )?;
+    let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
+    run_vm(default_raw, &[Send(provision_command)], directory_shares)?;
 
     Ok(())
 }
@@ -313,7 +594,7 @@ fn ensure_instance_disk(
     println!("Creating instance disk from {}...", template_raw.display());
     std::fs::create_dir_all(instance_raw.parent().unwrap())?;
     fs::copy(template_raw, instance_raw)?;
-    resize(instance_raw, DISK_SIZE_GB)?;
+    resize(instance_raw, DISK_SIZE_BYTES)?;
     Ok(())
 }
 
@@ -603,23 +884,36 @@ fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std
 }
 
 fn spawn_login_actions_thread(
-    login_actions: Vec<LoginActions>,
+    login_actions: Vec<LoginAction>,
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<VmInput>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for a in login_actions {
             match a {
-                WaitFor(text) => {
-                    if WaitResult::Timeout
-                        == output_monitor.wait_for(&text, Duration::from_secs(120))
-                    {
-                        eprintln!("Login action timed out waiting for '{}'", &text);
+                Expect { text, timeout } => {
+                    if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
+                        eprintln!(
+                            "Login action timed out waiting for '{}' after {:?}",
+                            &text, timeout
+                        );
                         return;
                     }
                 }
-                Type(mut text) => {
+                Send(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
+                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                }
+                Script { path, index } => {
+                    let command = match script_command_from_path(&path, index) {
+                        Ok(command) => command,
+                        Err(err) => {
+                            eprintln!("{err}");
+                            return;
+                        }
+                    };
+                    let mut text = command;
+                    text.push('\n');
                     input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
                 }
             }
@@ -629,7 +923,7 @@ fn spawn_login_actions_thread(
 
 fn run_vm(
     disk_path: &Path,
-    login_actions: &[LoginActions],
+    login_actions: &[LoginAction],
     directory_shares: &[DirectoryShare],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
@@ -688,14 +982,20 @@ fn run_vm(
     let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
 
     let mut all_login_actions = vec![
-        WaitFor("login: ".to_string()),
-        Type("root".to_string()),
-        WaitFor("~#".to_string()),
+        Expect {
+            text: "login: ".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
+        Send("root".to_string()),
+        Expect {
+            text: "~#".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
     ];
 
     if !directory_shares.is_empty() {
-        all_login_actions.push(Type("mkdir -p /mnt/shared".into()));
-        all_login_actions.push(Type(format!(
+        all_login_actions.push(Send("mkdir -p /mnt/shared".into()));
+        all_login_actions.push(Send(format!(
             "mount -t virtiofs {} /mnt/shared",
             SHARED_DIRECTORIES_TAG
         )));
@@ -703,8 +1003,8 @@ fn run_vm(
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Type(format!("mkdir -p {}", guest)));
-            all_login_actions.push(Type(format!("mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Send(format!("mkdir -p {}", guest)));
+            all_login_actions.push(Send(format!("mount --bind {} {}", staging, guest)));
         }
     }
 
@@ -761,8 +1061,7 @@ fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::E
     Ok(NSURL::fileURLWithPath(&ns_path))
 }
 
-fn resize(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let size_bytes = size_gb * 1024 * 1024 * 1024;
+fn resize(path: &Path, size_bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
     let file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(size_bytes)?;
     Ok(())
