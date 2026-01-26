@@ -37,58 +37,28 @@ Alternatively, if you want to modify it for your own needs, all you need is a Ru
 
 Vibe can be invoked in several ways:
 
-- `vibe` is the "do what I mean" default invocation.
-  The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/` and configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
-  When you run `vibe` in a project directory, it copies this configured image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
+- `vibe` is the "do what I mean" default invocation, which:
+  - shares the current directory with the VM
+  - shares package manager cache directories with the VM, so that packages are not re-downloaded
+  - shares the `~/.codex` directory with the VM, so you can use OpenAI's `codex`
 
+  The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc., and saved as `default.raw`.
+  Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
+  
   When you `exit` this shell, the VM is shutdown.
   The disk state persists until you delete it.
-  There is no centralized registry of VMs--- if you want to delete a VM, just delete its disk image file.
+  There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
+  
+- `vibe path/to/disk.raw` works as above, but uses the specified disk image (which must exist) rather than the one at `.vibe/instance.raw`.
 
-- `vibe plan` prints the shell commands that would be invoked by `vibe`.
-
-- `vibe run disk.raw` is an explicit mode where the VM disk image must already exist, all mounts must be specified, and all login commands must be specified.
-
-- `vibe show [built-in-file.sh]` prints the contents of a default shell script built into the binary.
+- `vibe show [built-in-file.sh]` prints the contents of a default shell script built into the binary, so you can see how things work.
    If no argument is given, a list of all built-in scripts will be returned.
 
+The behavior of `vibe` can be modified with these command line flags, which may be provided at most once:
 
-The best way to understand how vibe works is to run `vibe plan`:
+- `--no-default-mounts` disables the default mounts described above.
 
-    $ vibe plan
-
-    SHA=e4992939b0aacc98a0f23f50b196259e336b699369323630ba0e4def71c20cec395478c9da9202694314c55a99457dc1e5a1e29a3afd85aa07ae92faf3044d95
-
-    mkdir -p ~/.cache/vibe/                                                                                        &&
-    curl                                                              \
-      --compressed                                                    \
-      --location                                                      \
-      --fail                                                          \
-      -o ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.tar.xz   \
-      https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz      &&
-
-    echo "$SHA  ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw" | /usr/bin/shasum --algorithm 512 --check &&
-
-    tar -xOf                                                          \
-      ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.tar.xz      \
-      ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw                                                      &&
-
-
-    vibe run ~/.cache/vibe/debian-13-nocloud-arm64-20260112-2355.raw  \
-      --mount ~/.cache/vibe/.guest-mise-cache:/root/.local/share/mise \
-      --wait "login: "                                                \
-      --send "root"                                                   \
-      --wait "# "                                                     \
-      --script <(vibe show provision.sh)
-      
-    [... TODO, replace this with actual vibe plan output ]      
-
-You can build your own workflows on top of vibe by saving these commands in your own wrapper shell scripts.
-
-## Command reference
-
-The following flags apply to `vibe` and `vibe run`.
-All flags can be specified as many times as desired.
+These flags can be provided as many times as desired:
 
 - `--mount host-path:guest-path[:read-only | :read-write]` mount `host-path` inside VM at `guest-path`.
   Suffix defaults to `:read-write`.
@@ -96,10 +66,10 @@ All flags can be specified as many times as desired.
 
 - `--script filename.sh` run script in VM.
 
-- `--expect string [timeout-seconds]` wait for `string` to appear in console output before executing next `--script` or `--send`.
-  Optional timeout defaults to `30`.
-
 - `--send some-command` type `some-command` followed by a newline into the VM.
+
+- `--expect string [timeout-seconds]` wait for `string` to appear in console output before executing next `--script` or `--send`.
+  If `string` does not appear within timeout (defaults to `30` seconds), `vibe` exits with error.
 
 
 ## Other notes
@@ -161,6 +131,7 @@ I wrote this software for myself, and I'm open to pull requests and otherwise co
   - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
 - propagate an exit code from within VM to the `vibe` command
 - CPU core / memory / networking configuration via extended attributes on the disk image file
+- a `--plan` flag which shows
 
 I'm not sure about (but open to discussing proposals via GitHub issues):
 
