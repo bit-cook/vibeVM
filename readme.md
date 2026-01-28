@@ -48,10 +48,11 @@ I'm using virtual machines rather than containers because:
 
 Finally, as a matter of taste and style:
 
+- The binary is < 1 MB.
 - I wrote the entire README myself, 100% with my human brain.
 - The entire implementation is in one ~1200 line Rust file.
-- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [clap](https://github.com/clap-rs/clap/) argument parser.
-- There are no emojis anywhere in this repository.
+- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [lexopt](https://github.com/blyxxyz/lexopt) argument parser.
+- There are no emoji anywhere in this repository.
 
 
 ## Install
@@ -81,40 +82,39 @@ If you don't have `cargo`, you need to install Rust:
 
 ## Using Vibe
 
-Vibe can be invoked in two ways:
 
-- `vibe` is the "do what I mean" default invocation, which:
-  - shares the current directory with the VM
-  - shares package manager cache directories with the VM, so that packages are not re-downloaded
-  - shares the `~/.codex` directory with the VM, so you can use OpenAI's [codex](https://openai.com/codex/)
-  - shares the `~/.claude` directory with the VM, so you can use Anthropic's [claude](https://claude.com/product/claude-code)
+```
+vibe [OPTIONS] [disk-image.raw]
 
-  The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc., and saved as `default.raw`.
-  Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
+Options
 
-  When you `exit` this shell, the VM is shutdown.
-  The disk state persists until you delete it.
-  There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
+  --help                                                    Print this help message.
+  --version                                                 Print the version (commit SHA).
+  --no-default-mounts                                       Disable all default mounts.
+  --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
+                                                            Defaults to read-write.
+                                                            Errors if host-path does not exist.
+  --script <path/to/script.sh>                              Run script in VM.
+  --send <some-command>                                     Type `some-command` followed by newline into the VM.
+  --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
+                                                            If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+```
 
-- `vibe path/to/disk.raw` works as above, but uses the specified disk image (which must exist) rather than the one at `.vibe/instance.raw`.
+Invoking vibe without a disk image:
 
-The behavior of `vibe` can be modified with these command line flags, which may be provided at most once:
+- shares the current directory with the VM
+- shares package manager cache directories with the VM, so that packages are not re-downloaded
+- shares the `~/.codex` directory with the VM, so you can use OpenAI's [codex](https://openai.com/codex/)
+- shares the `~/.claude` directory with the VM, so you can use Anthropic's [claude](https://claude.com/product/claude-code)
 
-- `--no-default-mounts` disables the default mounts described above.
+The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, rust, etc., and saved as `default.raw`.
+(See [provision.sh](/src/provision.sh) for details.)
 
-These flags can be provided as many times as desired:
+Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
 
-- `--mount host-path:guest-path[:read-only | :read-write]` mount `host-path` inside VM at `guest-path`.
-  Suffix defaults to `:read-write`.
-  If a host-path does not exist, an error will be thrown.
-
-- `--script filename.sh` run script in VM.
-
-- `--send some-command` type `some-command` followed by a newline into the VM.
-
-- `--expect string [timeout-seconds]` wait for `string` to appear in console output before executing next `--script` or `--send`.
-  If `string` does not appear within timeout (defaults to `30` seconds), `vibe` exits with error.
-
+When you `exit` this shell, the VM is shutdown.
+The disk state persists until you delete it.
+There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
 
 ## Other notes
 
@@ -189,7 +189,6 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
-- alternatives to the `--send` and `--expect` CLI flags; getting them in the right order via Clap requires some effort (and it might be nice to drop the Clap dependency entirely anyway...)
 
 I'm not interested in:
 

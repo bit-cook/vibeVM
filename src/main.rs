@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Read, Write},
     os::unix::{
         io::{AsRawFd, IntoRawFd, OwnedFd},
@@ -18,8 +20,8 @@ use std::{
 };
 
 use block2::RcBlock;
-use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as ClapCommand};
 use dispatch2::DispatchQueue;
+use lexopt::prelude::*;
 use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
@@ -110,12 +112,35 @@ impl DirectoryShare {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let matches = build_cli().get_matches();
+    let args = parse_cli()?;
 
-    if matches.get_flag("version") {
+    if args.version {
         println!("Vibe");
         println!("https://github.com/lynaghk/vibe/");
         println!("Git SHA: {}", env!("GIT_SHA"));
+        std::process::exit(0);
+    }
+
+    if args.help {
+        println!(
+            "Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
+
+vibe [OPTIONS] [disk-image.raw]
+
+Options
+
+  --help                                                    Print this help message.
+  --version                                                 Print the version (commit SHA).
+  --no-default-mounts                                       Disable all default mounts.
+  --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
+                                                            Defaults to read-write.
+                                                            Errors if host-path does not exist.
+  --script <path/to/script.sh>                              Run script in VM.
+  --send <some-command>                                     Type `some-command` followed by newline into the VM.
+  --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
+                                                            If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+"
+        );
         std::process::exit(0);
     }
 
@@ -154,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
-    let disk_path = if let Some(path) = matches.get_one::<PathBuf>("disk").cloned() {
+    let disk_path = if let Some(path) = args.disk {
         if !path.exists() {
             return Err(format!("Disk image does not exist: {}", path.display()).into());
         }
@@ -174,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut login_actions = Vec::new();
     let mut directory_shares = Vec::new();
 
-    if !matches.get_flag("no-default-mounts") {
+    if !args.no_default_mounts {
         login_actions.push(Send(format!("cd {project_name}")));
 
         // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
@@ -212,10 +237,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(mounts) = matches.get_many::<String>("mount") {
-        for spec in mounts {
-            directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
-        }
+    for spec in &args.mounts {
+        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
     if let Some(motd_action) = motd_login_action(&directory_shares) {
@@ -223,123 +246,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Any user-provided login actions must come after our system ones
-    login_actions.extend(collect_ordered_actions(&matches)?);
+    login_actions.extend(args.login_actions);
 
     run_vm(&disk_path, &login_actions, &directory_shares[..])
 }
 
-fn build_cli() -> ClapCommand {
-    ClapCommand::new("vibe")
-        .arg(
-            Arg::new("disk")
-                .value_name("DISK")
-                .value_parser(value_parser!(PathBuf)),
-        )
-        .arg(
-            Arg::new("version")
-                .long("version")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-default-mounts")
-                .long("no-default-mounts")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("mount")
-                .long("mount")
-                .action(ArgAction::Append)
-                .value_name("host-path:guest-path[:read-only|:read-write]")
-                .value_parser(value_parser!(String)),
-        )
-        .arg(
-            Arg::new("script")
-                .long("script")
-                .action(ArgAction::Append)
-                .value_name("FILE")
-                .value_parser(value_parser!(String)),
-        )
-        .arg(
-            Arg::new("send")
-                .long("send")
-                .action(ArgAction::Append)
-                .value_name("COMMAND")
-                .value_parser(value_parser!(String)),
-        )
-        .arg(
-            Arg::new("expect")
-                .long("expect")
-                .action(ArgAction::Append)
-                .num_args(1..=2)
-                .value_names(["STRING", "TIMEOUT"])
-                .value_parser(value_parser!(String)),
-        )
+struct CliArgs {
+    disk: Option<PathBuf>,
+    version: bool,
+    help: bool,
+    no_default_mounts: bool,
+    mounts: Vec<String>,
+    login_actions: Vec<LoginAction>,
 }
 
-fn collect_ordered_actions(
-    matches: &ArgMatches,
-) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
-    let mut ordered: Vec<(usize, LoginAction)> = Vec::new();
-
-    for (index, values) in collect_occurrences_with_indices(matches, "script") {
-        let [path] = values.as_slice() else {
-            return Err("--script expects exactly one value".into());
-        };
-        ordered.push((
-            index,
-            Script {
-                path: path.into(),
-                index,
-            },
-        ));
+fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
+    fn os_to_string(value: OsString, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
+        value
+            .into_string()
+            .map_err(|_| format!("{flag} expects valid UTF-8").into())
     }
 
-    for (index, values) in collect_occurrences_with_indices(matches, "send") {
-        let [text] = values.as_slice() else {
-            return Err("--send expects exactly one value".into());
-        };
-        ordered.push((index, Send(text.clone())));
-    }
+    let mut parser = lexopt::Parser::from_env();
+    let mut disk = None;
+    let mut version = false;
+    let mut help = false;
+    let mut no_default_mounts = false;
+    let mut mounts = Vec::new();
+    let mut login_actions = Vec::new();
+    let mut script_index = 0;
 
-    for (index, values) in collect_occurrences_with_indices(matches, "expect") {
-        let (text, timeout) = match values.as_slice() {
-            [t] => (t.clone(), DEFAULT_EXPECT_TIMEOUT),
-            [t, secs] => (t.clone(), Duration::from_secs(secs.parse()?)),
-            _ => return Err("--expect expects a string and an optional timeout in seconds".into()),
-        };
-        ordered.push((index, Expect { text, timeout }));
-    }
-
-    ordered.sort_by_key(|(i, _)| *i);
-    Ok(ordered.into_iter().map(|(_, a)| a).collect())
-}
-
-fn collect_occurrences_with_indices(matches: &ArgMatches, id: &str) -> Vec<(usize, Vec<String>)> {
-    let occurrences: Vec<Vec<String>> = matches
-        .get_occurrences::<String>(id)
-        .map(|occ| {
-            occ.map(|values| values.map(|v| v.to_string()).collect())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut indices = matches.indices_of(id).unwrap_or_default();
-    let mut out = Vec::with_capacity(occurrences.len());
-    for values in occurrences {
-        let mut first_index = None;
-        for _ in 0..values.len() {
-            let idx = indices
-                .next()
-                .ok_or_else(|| format!("Missing indices for argument {id}"))
-                .unwrap();
-            if first_index.is_none() {
-                first_index = Some(idx);
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Long("version") => version = true,
+            Long("help") | Short('h') => help = true,
+            Long("no-default-mounts") => no_default_mounts = true,
+            Long("mount") => {
+                mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
+            Long("script") => {
+                login_actions.push(Script {
+                    path: os_to_string(parser.value()?, "--script")?.into(),
+                    index: script_index,
+                });
+                script_index += 1;
+            }
+            Long("send") => {
+                login_actions.push(Send(os_to_string(parser.value()?, "--send")?));
+            }
+            Long("expect") => {
+                let text = os_to_string(parser.value()?, "--expect")?;
+                let timeout = match parser.optional_value() {
+                    Some(value) => Duration::from_secs(os_to_string(value, "--expect")?.parse()?),
+                    None => DEFAULT_EXPECT_TIMEOUT,
+                };
+                login_actions.push(Expect { text, timeout });
+            }
+            Value(value) => {
+                if disk.is_some() {
+                    return Err("Only one disk path may be provided".into());
+                }
+                disk = Some(PathBuf::from(value));
+            }
+            _ => return Err(arg.unexpected().into()),
         }
-        out.push((first_index.unwrap(), values));
     }
 
-    out
+    Ok(CliArgs {
+        disk,
+        version,
+        help,
+        no_default_mounts,
+        mounts,
+        login_actions,
+    })
 }
 
 fn script_command_from_path(
@@ -431,7 +411,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!("clear && cat <<'VIBE_MOTD'\n{output}VIBE_MOTD\n");
+    let command = format!("clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
     Some(Send(command))
 }
 
