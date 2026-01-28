@@ -18,19 +18,16 @@ Dependencies:
 
 ## Install
 
-Vibe is a single binary, so it's easy to install.
-
-If you use the excellent [mise-en-place](https://mise.jdx.dev/), it can download the pre-complied binary from Github for you:
-
-    mise use github:lynaghk/vibe@latest
-    
-Or you can grab the binary yourself and put it on your `$PATH`.
-
-Alternatively, if you want to modify it for your own needs, all you need is a Rust toolchain:
+Vibe is a single binary built with Rust.
+I'm not making formal releases or keeping a changelog, so your best bet is to grab the repo and build it yourself:
 
     git clone ssh://git@github.com:lynaghk/vibe
     cd vibe
     cargo install
+    
+If you don't plan on making any changes yourself to the code, you can do:
+
+    cargo install --locked --git ssh://git@github.com/lynaghk/vibe.git
 
 
 ## Using Vibe

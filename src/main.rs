@@ -112,6 +112,13 @@ impl DirectoryShare {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = build_cli().get_matches();
 
+    if matches.get_flag("version") {
+        println!("Vibe");
+        println!("https://github.com/lynaghk/vibe/");
+        println!("Git SHA: {}", env!("GIT_SHA"));
+        std::process::exit(0);
+    }
+
     ensure_signed();
 
     let project_root = env::current_dir()?;
@@ -224,6 +231,11 @@ fn build_cli() -> ClapCommand {
             Arg::new("disk")
                 .value_name("DISK")
                 .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("version")
+                .long("version")
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("no-default-mounts")
