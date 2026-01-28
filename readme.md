@@ -56,13 +56,22 @@ Finally, as a matter of taste and style:
 ## Install
 
 Vibe is a single binary built with Rust.
-I'm not making formal releases or keeping a changelog, so your best bet is to grab the repo and build it yourself:
 
-    git clone ssh://git@github.com:lynaghk/vibe
-    cd vibe
-    cargo install
+Download the latest binary built by GitHub actions and put it somewhere on your `$PATH`:
+For example:
 
-If you don't plan on making any changes yourself to the code, you can do:
+    curl -O vibe https://github.com/lynaghk/vibe/releases/download/latest/vibe
+    sudo mv vibe /usr/local/bin
+
+
+If you use [mise-en-place](https://mise.jdx.dev/):
+
+    mise add github:lynaghk/vibe@latest
+
+I'm not making formal releases or keeping a changelog.
+I recommend reading the commit history and pinning to a specific SHA (replace `latest` above with a SHA).
+
+You can also install via `cargo`:
 
     cargo install --locked --git ssh://git@github.com/lynaghk/vibe.git
 
