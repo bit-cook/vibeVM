@@ -48,10 +48,11 @@ I'm using virtual machines rather than containers because:
 
 Finally, as a matter of taste and style:
 
+- The binary is < 1 MB.
 - I wrote the entire README myself, 100% with my human brain.
 - The entire implementation is in one ~1200 line Rust file.
-- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [clap](https://github.com/clap-rs/clap/) argument parser.
-- There are no emojis anywhere in this repository.
+- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [lexopt](https://github.com/blyxxyz/lexopt) argument parser.
+- There are no emoji anywhere in this repository.
 
 
 ## Install
@@ -189,7 +190,6 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
-- alternatives to the `--send` and `--expect` CLI flags; getting them in the right order via Clap requires some effort (and it might be nice to drop the Clap dependency entirely anyway...)
 
 I'm not interested in:
 
