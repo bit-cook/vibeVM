@@ -19,6 +19,7 @@ Host                                      Guest                    Mode
 /Users/dev/.m2                            /root/.m2                read-write
 /Users/dev/.cargo/registry                /root/.cargo/registry    read-write
 /Users/dev/.codex                         /root/.codex             read-write
+/Users/dev/.claude                        /root/.claude            read-write
 
 root@vibe:~/my-project#
 ```
@@ -78,7 +79,8 @@ Vibe can be invoked in two ways:
 - `vibe` is the "do what I mean" default invocation, which:
   - shares the current directory with the VM
   - shares package manager cache directories with the VM, so that packages are not re-downloaded
-  - shares the `~/.codex` directory with the VM, so you can use OpenAI's `codex`
+  - shares the `~/.codex` directory with the VM, so you can use OpenAI's [codex](https://openai.com/codex/)
+  - shares the `~/.claude` directory with the VM, so you can use Anthropic's [claude](https://claude.com/product/claude-code)
 
   The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc., and saved as `default.raw`.
   Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
