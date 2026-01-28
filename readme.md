@@ -20,7 +20,7 @@ Host                                      Guest                    Mode
 /Users/dev/.cargo/registry                /root/.cargo/registry    read-write
 /Users/dev/.codex                         /root/.codex             read-write
 
-root@localhost:~/my-project#
+root@vibe:~/my-project#
 ```
 
 On my M1 MacBook Air it takes ~10 seconds to boot.

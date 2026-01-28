@@ -15,6 +15,9 @@ apt-get install -y --no-install-recommends      \
         git                                     \
         ripgrep
 
+# Set hostname to "vibe" so it's clear that you're inside the VM.
+hostnamectl set-hostname vibe
+
 curl https://mise.run | sh
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
 
