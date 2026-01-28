@@ -85,6 +85,10 @@ These flags can be provided as many times as desired:
 
 - MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
 
+- Debian "nocloud" is used as a base image because it boots directly to a root prompt.
+  The other images use [cloudinit](https://cloudinit.readthedocs.io/en/latest/), which I found much more complex:
+ - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
+ - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).
 
 ## Alternatives
 
@@ -126,16 +130,21 @@ I wrote this software for myself, and I'm open to pull requests and otherwise co
 - forwarding ports from the host to a guest
 - running `vibe` against a disk image that's already running should connect to the already-running VM
   - the VM shouldn't shutdown until all host terminals have logged out
-- if not the above, at least a check and nice error message when you try to start a VM that's already running.
+- if not the above, at least a check and throw a nice error message when you try to start a VM that's already running
 - a way to make faster-booting even more minimal Linux virtual machines
   - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
 - propagate an exit code from within VM to the `vibe` command
-- CPU core / memory / networking configuration via extended attributes on the disk image file
-- a `--plan` flag which shows
+- CPU core / memory / networking configuration, possibly via flags or via extended attributes on the disk image file
+- a `--plan` flag which pretty-prints a CLI invocation with all of the default arguments shown
+  - to keep ourselves honest, we should use the same codepath for the actual execution (maybe we can `exec` into the generated command?)
+  - Being fully "explicit" is tricky due to flag interactions.
+    E.g., the friendly `--mount` would need to be decomposed into two flags: One that exposes the host directory in the guest's staging area at `/mnt/shared/` and another flag `--send 'mount --bind ...'`to bind this to the desired guest location.
 
 I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
+- using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
+
 
 I'm not interested in:
 
