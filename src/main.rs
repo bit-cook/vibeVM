@@ -210,8 +210,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    login_actions.extend(collect_ordered_actions(&matches)?);
-
     if let Some(mounts) = matches.get_many::<String>("mount") {
         for spec in mounts {
             directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
@@ -221,6 +219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(motd_action) = motd_login_action(&directory_shares) {
         login_actions.push(motd_action);
     }
+
+    // Any user-provided login actions must come after our system ones
+    login_actions.extend(collect_ordered_actions(&matches)?);
 
     run_vm(&disk_path, &login_actions, &directory_shares[..])
 }
@@ -866,16 +867,18 @@ fn spawn_login_actions_thread(
     login_actions: Vec<LoginAction>,
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<VmInput>,
+    trigger_exit_tx: mpsc::Sender<String>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for a in login_actions {
             match a {
                 Expect { text, timeout } => {
                     if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
-                        eprintln!(
+                        let exit_msg = format!(
                             "Login action timed out waiting for '{}' after {:?}",
                             &text, timeout
                         );
+                        let _ = trigger_exit_tx.send(exit_msg);
                         return;
                     }
                 }
@@ -991,15 +994,18 @@ fn run_vm(
         all_login_actions.push(a.clone())
     }
 
+    let (trigger_exit_tx, trigger_exit_rx) = mpsc::channel();
     let login_actions_thread = spawn_login_actions_thread(
         all_login_actions,
         output_monitor.clone(),
         io_ctx.input_tx.clone(),
+        trigger_exit_tx,
     );
 
     let _raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
 
     let mut last_state = None;
+    let mut exit = Ok(());
     loop {
         unsafe {
             NSRunLoop::mainRunLoop().runMode_beforeDate(
@@ -1013,6 +1019,24 @@ fn run_vm(
             //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
+        match trigger_exit_rx.try_recv() {
+            Ok(msg) => {
+                exit = Err(msg.into());
+                unsafe {
+                    if vm.canRequestStop() {
+                        if let Err(err) = vm.requestStopWithError() {
+                            eprintln!("Failed to request VM stop: {:?}", err);
+                        }
+                    } else if vm.canStop() {
+                        let handler = RcBlock::new(|_error: *mut NSError| {});
+                        vm.stopWithCompletionHandler(&handler);
+                    }
+                }
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
             //eprintln!("VM stopped with state: {:?}", state);
             break;
@@ -1023,7 +1047,7 @@ fn run_vm(
 
     io_ctx.shutdown();
 
-    Ok(())
+    exit
 }
 
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {

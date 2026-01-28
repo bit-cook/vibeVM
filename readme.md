@@ -146,6 +146,7 @@ I wrote this software for myself, and I'm open to pull requests and otherwise co
 - a way to make faster-booting even more minimal Linux virtual machines
   - this should be bootstrappable on Mac; i.e., if the only way to make a small Linux image is with Linux-only tools, the entire process should still be runnable on MacOS via intermediate VMs
 - propagate an exit code from within VM to the `vibe` command
+- don't propagate user typing until all provided `--expect` and `--send` actions have completed
 - CPU core / memory / networking configuration, possibly via flags or via extended attributes on the disk image file
 - a `--plan` flag which pretty-prints a CLI invocation with all of the default arguments shown
   - to keep ourselves honest, we should use the same codepath for the actual execution (maybe we can `exec` into the generated command?)
