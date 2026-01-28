@@ -28,6 +28,7 @@ use objc2_virtualization::*;
 
 const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
 const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
+const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const DISK_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -470,10 +471,14 @@ fn ensure_base_image(
         return Ok(());
     }
 
-    if !base_compressed.exists() {
+    if !base_compressed.exists()
+        || std::fs::metadata(base_compressed).map(|m| m.len())? < DEBIAN_COMPRESSED_SIZE_BYTES
+    {
         println!("Downloading base image...");
         let status = Command::new("curl")
             .args([
+                "--continue-at",
+                "-",
                 "--compressed",
                 "--location",
                 "--fail",
