@@ -183,7 +183,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             login_actions.push(Send(r"mount -t tmpfs tmpfs .git/".into()));
         }
 
-        directory_shares.push(mise_directory_share);
         directory_shares.push(
             DirectoryShare::new(
                 project_root,
@@ -192,6 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .expect("Project directory must exist"),
         );
+
+        directory_shares.push(mise_directory_share);
 
         // Add default shares, if they exist
         for share in [

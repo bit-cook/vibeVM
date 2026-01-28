@@ -14,8 +14,8 @@ $ vibe
 
 Host                                      Guest                    Mode
 ----------------------------------------  -----------------------  ----------
-/Users/dev/.cache/vibe/.guest-mise-cache  /root/.local/share/mise  read-write
 /Users/dev/work/my-project                /root/my-project         read-write
+/Users/dev/.cache/vibe/.guest-mise-cache  /root/.local/share/mise  read-write
 /Users/dev/.m2                            /root/.m2                read-write
 /Users/dev/.cargo/registry                /root/.cargo/registry    read-write
 /Users/dev/.codex                         /root/.codex             read-write
