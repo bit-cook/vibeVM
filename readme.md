@@ -98,6 +98,8 @@ Options
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
+  --cpus <count>                                            Number of virtual CPUs (default 2).
+  --ram <megabytes>                                         RAM size in megabytes (default 2048).
   --script <path/to/script.sh>                              Run script in VM.
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.

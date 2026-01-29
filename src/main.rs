@@ -33,9 +33,11 @@ const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345
 const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
-const DISK_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const CPU_COUNT: usize = 4;
-const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BYTES_PER_MB: u64 = 1024 * 1024;
+const DISK_SIZE_BYTES: u64 = 10 * 1024 * BYTES_PER_MB;
+const DEFAULT_CPU_COUNT: usize = 2;
+const DEFAULT_RAM_MB: u64 = 2048;
+const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -138,6 +140,8 @@ Options
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
+  --cpus <count>                                            Number of virtual CPUs (default {DEFAULT_CPU_COUNT}).
+  --ram <megabytes>                                         RAM size in megabytes (default {DEFAULT_RAM_MB}).
   --script <path/to/script.sh>                              Run script in VM.
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
@@ -251,7 +255,13 @@ Options
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
 
-    run_vm(&disk_path, &login_actions, &directory_shares[..])
+    run_vm(
+        &disk_path,
+        &login_actions,
+        &directory_shares[..],
+        args.cpu_count,
+        args.ram_bytes,
+    )
 }
 
 struct CliArgs {
@@ -261,6 +271,8 @@ struct CliArgs {
     no_default_mounts: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
+    cpu_count: usize,
+    ram_bytes: u64,
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -278,12 +290,28 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
     let mut script_index = 0;
+    let mut cpu_count = DEFAULT_CPU_COUNT;
+    let mut ram_bytes = DEFAULT_RAM_BYTES;
 
     while let Some(arg) = parser.next()? {
         match arg {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
             Long("no-default-mounts") => no_default_mounts = true,
+            Long("cpus") => {
+                let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
+                if value == 0 {
+                    return Err("--cpus must be >= 1".into());
+                }
+                cpu_count = value;
+            }
+            Long("ram") => {
+                let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
+                if value == 0 {
+                    return Err("--ram must be >= 1".into());
+                }
+                ram_bytes = value * BYTES_PER_MB;
+            }
             Long("mount") => {
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
@@ -322,6 +350,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         no_default_mounts,
         mounts,
         login_actions,
+        cpu_count,
+        ram_bytes,
     })
 }
 
@@ -551,7 +581,13 @@ fn ensure_default_image(
     resize(default_raw, DISK_SIZE_BYTES)?;
 
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
-    run_vm(default_raw, &[Send(provision_command)], directory_shares)?;
+    run_vm(
+        default_raw,
+        &[Send(provision_command)],
+        directory_shares,
+        DEFAULT_CPU_COUNT,
+        DEFAULT_RAM_BYTES,
+    )?;
 
     Ok(())
 }
@@ -731,6 +767,8 @@ fn create_vm_configuration(
     directory_shares: &[DirectoryShare],
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
+    cpu_count: usize,
+    ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
     unsafe {
         let platform =
@@ -743,8 +781,8 @@ fn create_vm_configuration(
         let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
         config.setBootLoader(Some(&boot_loader));
-        config.setCPUCount(CPU_COUNT as NSUInteger);
-        config.setMemorySize(RAM_BYTES);
+        config.setCPUCount(cpu_count as NSUInteger);
+        config.setMemorySize(ram_bytes);
 
         config.setNetworkDevices(&NSArray::from_retained_slice(&[{
             let network_device = VZVirtioNetworkDeviceConfiguration::new();
@@ -919,11 +957,20 @@ fn run_vm(
     disk_path: &Path,
     login_actions: &[LoginAction],
     directory_shares: &[DirectoryShare],
+    cpu_count: usize,
+    ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
 
-    let config = create_vm_configuration(disk_path, directory_shares, vm_reads_from, vm_writes_to)?;
+    let config = create_vm_configuration(
+        disk_path,
+        directory_shares,
+        vm_reads_from,
+        vm_writes_to,
+        cpu_count,
+        ram_bytes,
+    )?;
 
     let queue = DispatchQueue::main();
 
