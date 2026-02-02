@@ -63,7 +63,9 @@ Download [the latest binary built by GitHub actions](https://github.com/lynaghk/
 
     curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-macos-arm64.zip
     unzip vibe-macos-arm64.zip
-    sudo mv vibe /usr/local/bin
+    mkdir -p ~/.local/bin
+    mv vibe ~/.local/bin
+    export PATH="$HOME/.local/bin:$PATH"
 
 If you use [mise-en-place](https://mise.jdx.dev/):
 
