@@ -26,12 +26,17 @@ jobs:
           echo "SHA_SHORT=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_ENV
           echo "BUILD_DATE=$(date +'%Y-%m-%d')"                       >> $GITHUB_ENV
 
+      - name: Package binary
+        run: |
+          cd target/release
+          zip vibe-macos-arm64.zip vibe
+
       - name: Create sha release
         run: |
           gh release create "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
             --title "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
             --notes "Built from commit ${{ github.sha }}" \
-            target/release/vibe
+            target/release/vibe-macos-arm64.zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -46,6 +51,6 @@ jobs:
             --title "Latest" \
             --notes "Built from commit ${{ github.sha }}" \
             --prerelease \
-            target/release/vibe
+            target/release/vibe-macos-arm64.zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
