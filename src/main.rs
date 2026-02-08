@@ -715,7 +715,8 @@ pub fn spawn_vm_io(
                             *raw_guard_inner = Some(guard);
                         }
 
-                        if stdout.write_all(bytes).is_err() {
+                        if let Err(e) = stdout.write_all(bytes) {
+                            eprintln!("[stdout_thread] write failed: {e:?}");
                             break;
                         }
                         let _ = stdout.flush();
@@ -732,7 +733,8 @@ pub fn spawn_vm_io(
         loop {
             match input_rx.recv() {
                 Ok(VmInput::Bytes(data)) => {
-                    if vm_writer.write_all(&data).is_err() {
+                    if let Err(e) = vm_writer.write_all(&data) {
+                        eprintln!("[mux] write failed: {e:?}");
                         break;
                     }
                 }
