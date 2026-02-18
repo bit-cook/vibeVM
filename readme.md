@@ -144,6 +144,11 @@ There is no centralized registry of VMs --- if you want to delete a VM, just del
   - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
   - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).
 
+- Claude Code requires both your `~/.claude` folder (shared in the VM by default) and also the `~/.claude.json` file for auth credentials and session history.
+  VirtioFS only works with folders, so there's not a nice way to "mount" the latter inside the VM.
+  However, you can paper this over with a shell script wrapper --- see [this issue](https://github.com/lynaghk/vibe/issues/18) for an example.
+  (Also: Wild to me that Anthropic puts both a file and a folder in your home directory --- how rude!)
+
 
 ## Alternatives
 
@@ -202,11 +207,6 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 - supporting Linux hosts
 - supporting guests beyond Debian Linux
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
-- making Claude Code work seamlessly
-  - I tried the native installer but it sometimes fails during setup (see 6352d13), so I switched back to NPM via mise which is more reliable.
-  - The `~/.claude` folder is shared in the VM by default, by apparently the `~/.claude.json` file is also required for auth credentials and session history.
-    I'm not sure the best way to share a file between host and VM (virtioFS only works with folders).
-    Also: Wild to me that Anthropic puts both a file and a folder in your home directory --- how rude!
 
 I'm not interested in:
 
