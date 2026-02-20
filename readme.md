@@ -93,7 +93,7 @@ vibe [OPTIONS] [disk-image.raw]
 Options
 
   --help                                                    Print this help message.
-  --version                                                 Print the version (commit SHA).
+  --version                                                 Print the version (commit SHA and build date).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
