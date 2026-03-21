@@ -146,9 +146,13 @@ There is no centralized registry of VMs --- if you want to delete a VM, just del
 
 - Claude Code requires both your `~/.claude` folder (shared in the VM by default) and also the `~/.claude.json` file for auth credentials and session history.
   VirtioFS only works with folders, so there's not a nice way to "mount" the latter inside the VM.
-  However, you can paper this over with a shell script wrapper --- see [this issue](https://github.com/lynaghk/vibe/issues/18) for an example.
-  (Also: Wild to me that Anthropic puts both a file and a folder in your home directory --- how rude!)
+  Here's what I recommend:
+  - Run `claude` and login. (You can do this in a VM or on your actual machine if you trust `claude`.)
+  - `mv ~/.claude.json ~/.claude/dot_claude_dot_json_should_have_been_here.json`
+  - make a shell alias/script to launch Vibe as:
 
+        vibe --send "ln -fs ~/.claude/dot_claude_dot_json_should_have_been_here.json ~/.claude.json" \
+             --send "IS_SANDBOX=1 claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"
 
 ## Alternatives
 
