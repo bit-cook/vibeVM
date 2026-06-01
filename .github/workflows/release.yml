@@ -19,11 +19,14 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install toolchains
+        uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Set short git commit SHA
         id: vars
