@@ -220,3 +220,9 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 I'm not interested in:
 
 - anything related to Docker / containers / Kubernetes / distributed systems
+
+
+When opening PRs, please ensure all commits have been formatted and pass tests. Run:
+
+    /scripts/format.sh
+    /scripts/test.sh
