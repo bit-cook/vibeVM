@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -140,6 +141,8 @@ Options
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --env NAME                                                Export host environment variable NAME inside VM.
+                                                            Errors if NAME is unset or empty.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
@@ -269,6 +272,8 @@ Options
         directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
+    login_actions.extend(env_login_actions(&args.env));
+
     // Enable bash history
     login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
@@ -294,6 +299,7 @@ struct CliArgs {
     version: bool,
     help: bool,
     no_default_mounts: bool,
+    env: HashMap<String, String>,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
     network_mode: NetworkMode,
@@ -313,6 +319,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut version = false;
     let mut help = false;
     let mut no_default_mounts = false;
+    let mut env_vars = HashMap::new();
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
     let mut network_mode = NetworkMode::Nat;
@@ -325,6 +332,21 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
             Long("no-default-mounts") => no_default_mounts = true,
+            Long("env") => {
+                let name = os_to_string(parser.value()?, "--env")?;
+                assert!(
+                    !env_vars.contains_key(&name),
+                    "Duplicate --env value: {name}"
+                );
+                let value = env::var(&name).unwrap_or_else(|_| {
+                    panic!("--env {name} is not set or is not valid UTF-8 in the host environment")
+                });
+                assert!(
+                    !value.is_empty(),
+                    "--env {name} is empty in the host environment"
+                );
+                env_vars.insert(name, value);
+            }
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
                 if value == 0 {
@@ -379,12 +401,20 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         version,
         help,
         no_default_mounts,
+        env: env_vars,
         mounts,
         login_actions,
         network_mode,
         cpu_count,
         ram_bytes,
     })
+}
+
+fn env_login_actions(env: &HashMap<String, String>) -> Vec<LoginAction> {
+    env.iter()
+        //leading space to keep env out of bash history; escape single quotes in value
+        .map(|(name, value)| Send(format!(" export {name}='{}'", value.replace('\'', r"'\''"))))
+        .collect()
 }
 
 fn script_command_from_path(

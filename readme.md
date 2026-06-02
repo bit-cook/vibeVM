@@ -91,6 +91,8 @@ Options
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --env NAME                                                Export host environment variable NAME inside VM.
+                                                            Errors if NAME is unset or empty.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
