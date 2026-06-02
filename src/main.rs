@@ -106,15 +106,14 @@ impl DirectoryShare {
 
     fn tag(&self) -> String {
         let path_str = self.host.to_string_lossy();
-        let hash = path_str
-            .bytes()
-            .fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64));
+        let hash = path_str.bytes().fold(5381u64, |h, b| {
+            h.wrapping_mul(33).wrapping_add(u64::from(b))
+        });
         let base_name = self
             .host
             .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or("share".into());
-        format!("{}_{:016x}", base_name, hash)
+            .map_or("share".into(), |s| s.to_string_lossy());
+        format!("{base_name}_{hash:016x}")
     }
 }
 
@@ -170,9 +169,7 @@ Options
         .into_owned();
 
     let home = env::var("HOME").map(PathBuf::from)?;
-    let cache_home = env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".cache"));
+    let cache_home = env::var("XDG_CACHE_HOME").map_or_else(|_| home.join(".cache"), PathBuf::from);
     let cache_dir = cache_home.join("vibe");
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
@@ -228,7 +225,7 @@ Options
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
+                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {subfolder}")));
             }
         }
 
@@ -259,7 +256,7 @@ Options
         .into_iter()
         .flatten()
         {
-            directory_shares.push(share)
+            directory_shares.push(share);
         }
         // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
         login_actions.push(Send(
@@ -487,8 +484,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
 ",
     );
     output.push_str(&format!(
-        "{host_header:<host_width$}  {guest_header:<guest_width$}  {mode_header}\n",
-        host_width = host_width
+        "{host_header:<host_width$}  {guest_header:<guest_width$}  {mode_header}\n"
     ));
     output.push_str(&format!(
         "{:-<host_width$}  {:-<guest_width$}  {:-<mode_width$}\n",
@@ -684,6 +680,7 @@ pub struct IoContext {
     stdout_thread: thread::JoinHandle<()>,
 }
 
+#[must_use]
 pub fn create_pipe() -> (OwnedFd, OwnedFd) {
     let (read_stream, write_stream) = UnixStream::pair().expect("Failed to create socket pair");
     (read_stream.into(), write_stream.into())
@@ -709,7 +706,7 @@ pub fn spawn_vm_io(
         Error,
     }
 
-    fn poll_with_wakeup<'a>(main_fd: RawFd, wakeup_fd: RawFd, buf: &'a mut [u8]) -> PollResult<'a> {
+    fn poll_with_wakeup(main_fd: RawFd, wakeup_fd: RawFd, buf: &mut [u8]) -> PollResult<'_> {
         let mut fds = [
             libc::pollfd {
                 fd: main_fd,
@@ -727,7 +724,7 @@ pub fn spawn_vm_io(
         if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
             PollResult::Shutdown
         } else if fds[0].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(main_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
                 PollResult::Error
             } else if n == 0 {
@@ -833,7 +830,7 @@ pub fn spawn_vm_io(
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let poll_result = unsafe { libc::poll(&mut pollfd, 1, 200) };
+                let poll_result = unsafe { libc::poll(&raw mut pollfd, 1, 200) };
                 if poll_result > 0 && (pollfd.revents & libc::POLLIN) != 0 {
                     break;
                 }
@@ -869,7 +866,7 @@ pub fn spawn_vm_io(
 impl IoContext {
     pub fn shutdown(self) {
         let _ = self.input_tx.send(VmInput::Shutdown);
-        unsafe { libc::write(self.wakeup_write.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
+        unsafe { libc::write(self.wakeup_write.as_raw_fd(), b"x".as_ptr().cast(), 1) };
         let _ = self.stdin_thread.join();
         let _ = self.stdout_thread.join();
         let _ = self.mux_thread.join();
@@ -967,7 +964,7 @@ fn create_vm_configuration(
             let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
                 NSMutableDictionary::new();
 
-            for share in directory_shares.iter() {
+            for share in directory_shares {
                 assert!(
                     share.host.is_dir(),
                     "path does not exist or is not a directory: {:?}",
@@ -1086,7 +1083,7 @@ fn spawn_login_actions_thread(
                 Expect { text, timeout } => {
                     if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
                         let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
-                            action: format!("expect '{}'", text),
+                            action: format!("expect '{text}'"),
                             timeout,
                         });
                         return;
@@ -1167,7 +1164,7 @@ fn run_vm(
 
         match rx.try_recv() {
             Ok(result) => {
-                result.map_err(|e| format!("Failed to start VM: {}", e))?;
+                result.map_err(|e| format!("Failed to start VM: {e}"))?;
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => continue,
@@ -1218,20 +1215,19 @@ fn run_vm(
     if !directory_shares.is_empty() {
         all_login_actions.push(Send(" mkdir -p /mnt/shared".into()));
         all_login_actions.push(Send(format!(
-            " mount -t virtiofs {} /mnt/shared",
-            SHARED_DIRECTORIES_TAG
+            " mount -t virtiofs {SHARED_DIRECTORIES_TAG} /mnt/shared"
         )));
 
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!(" mkdir -p {}", guest)));
-            all_login_actions.push(Send(format!(" mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Send(format!(" mkdir -p {guest}")));
+            all_login_actions.push(Send(format!(" mount --bind {staging} {guest}")));
         }
     }
 
     for a in login_actions {
-        all_login_actions.push(a.clone())
+        all_login_actions.push(a.clone());
     }
 
     let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
@@ -1260,14 +1256,13 @@ fn run_vm(
         match vm_output_rx.try_recv() {
             Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
                 exit_result = Err(format!(
-                    "Login action ({}) timed out after {:?}; shutting down.",
-                    action, timeout
+                    "Login action ({action}) timed out after {timeout:?}; shutting down."
                 )
                 .into());
                 unsafe {
                     if vm.canRequestStop() {
                         if let Err(err) = vm.requestStopWithError() {
-                            eprintln!("Failed to request VM stop: {:?}", err);
+                            eprintln!("Failed to request VM stop: {err:?}");
                         }
                     } else if vm.canStop() {
                         let handler = RcBlock::new(|_error: *mut NSError| {});
@@ -1320,7 +1315,7 @@ fn terminal_size(fd: i32) -> Option<(u16, u16)> {
 fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
     let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
 
-    if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
+    if unsafe { libc::tcgetattr(fd, &raw mut attributes) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -1333,7 +1328,7 @@ fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
     attributes.c_cc[libc::VMIN] = 0;
     attributes.c_cc[libc::VTIME] = 1;
 
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const attributes) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -1348,7 +1343,7 @@ struct RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original);
         }
     }
 }

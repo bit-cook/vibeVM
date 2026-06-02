@@ -58,13 +58,17 @@ fn main() {
         let sha = Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "unknown".into());
+            .map_or_else(
+                |_| "unknown".into(),
+                |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            );
         let build_date = Command::new("date")
             .args(["-u", "+%F"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "unknown".into());
+            .map_or_else(
+                |_| "unknown".into(),
+                |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            );
 
         println!("cargo:rustc-env=GIT_SHA={sha}");
         println!("cargo:rustc-env=BUILD_DATE={build_date}");

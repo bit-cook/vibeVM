@@ -119,7 +119,7 @@ fn configure_usernet_socket(fd: RawFd) {
                 fd,
                 libc::SOL_SOCKET,
                 opt,
-                &value as *const _ as *const libc::c_void,
+                (&raw const value).cast::<libc::c_void>(),
                 std::mem::size_of_val(&value) as libc::socklen_t,
             )
         };
@@ -168,7 +168,7 @@ impl UsernetHelperProcess {
         };
 
         let timeout_ms = 3000;
-        let poll_result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        let poll_result = unsafe { libc::poll(&raw mut pollfd, 1, timeout_ms) };
         if poll_result < 0 {
             return Err(io::Error::last_os_error().into());
         }
