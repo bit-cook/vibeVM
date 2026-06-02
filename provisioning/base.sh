@@ -35,16 +35,72 @@ echo 'Acquire::http::Timeout "2";' | tee /etc/apt/apt.conf.d/99timeout
 echo 'Acquire::https::Timeout "2";' | tee -a /etc/apt/apt.conf.d/99timeout
 echo 'Acquire::Retries "2";' | tee -a /etc/apt/apt.conf.d/99timeout
 
-apt-get update
-apt-get install -y --no-install-recommends      \
-        cloud-guest-utils                       \
-        build-essential                         \
-        pkg-config                              \
-        libssl-dev                              \
-        curl                                    \
-        git                                     \
-        tmux                                    \
-        ripgrep
+apt update
+
+##########################################################
+# Use debian fast-forward so we get newer package versions
+
+apt install --no-install-recommends --update --yes ca-certificates gnupg debian-keyring wget
+
+mkdir -p /usr/share/debian-fastforward/pgp-keys
+
+wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+wget https://deb.fastforward.debian.net/debian-fastforward/project/pgp/fastforward-debian-13-trixie-signing-key.pub.sig -O /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
+
+gpg --keyring /usr/share/keyrings/debian-keyring.gpg --keyring /usr/share/keyrings/debian-maintainers.gpg --verify /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
+rm -f /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg.sig
+
+gpg --import /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+rm -f /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+gpg -o /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg --export 2BDDB08FA13971B749E4A221F93CF7F4CEBEC933
+
+sh -c 'cat > /etc/apt/sources.list.d/debian-fastforward.sources << EOF
+# /etc/apt/sources.list.d/debian-fastforward.sources
+
+Types: deb
+URIs: https://deb.fastforward.debian.net/debian-fastforward
+Suites: trixie-fastforward trixie-fastforward-security trixie-fastforward-updates trixie-fastforward-backports
+Components: main contrib non-free non-free-firmware
+PDiffs: no
+Signed-By: /usr/share/debian-fastforward/pgp-keys/deb.fastforward.debian.net.gpg
+EOF'
+
+sh -c 'cat > /etc/apt/preferences.d/debian-fastforward.pref << EOF
+# /etc/apt/preferences.d/debian-fastforward.pref
+
+Package: *
+Pin: release n=trixie-fastforward
+Pin-Priority: 990
+
+Package: *
+Pin: release n=trixie-fastforward-security
+Pin-Priority: 990
+
+Package: *
+Pin: release n=trixie-fastforward-updates
+Pin-Priority: 990
+
+Package: *
+Pin: release n=trixie-fastforward-backports
+Pin-Priority: 990
+EOF'
+
+apt full-upgrade --update --yes
+
+##########################################################
+# End of debian fast forward
+
+
+
+apt install --no-install-recommends --yes \
+  cloud-guest-utils                       \
+  build-essential                         \
+  pkg-config                              \
+  libssl-dev                              \
+  curl                                    \
+  git                                     \
+  tmux                                    \
+  ripgrep
 
 
 # Expand disk partition
