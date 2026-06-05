@@ -91,6 +91,10 @@ cat > .config/mise/config.toml <<MISE
     [settings]
     # Always use the venv created by uv, if available in directory
     python.uv_venv_auto = true
+
+    # Trust everything by default, since we're already in a VM sandbox
+    trusted_config_paths = ["/"]
+
     experimental = true
 
     [tools]
