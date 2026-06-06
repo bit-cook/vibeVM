@@ -1,5 +1,34 @@
 #!/bin/bash
+# Base provisioning script that installs mise-en-place and sets up VM disk.
 set -euxo pipefail
+
+image_history=/root/vibe-image-history.txt
+base_first_run=false
+if [[ ! -e "${image_history}" ]]; then
+  base_first_run=true
+fi
+
+{
+  if [[ -s "${image_history}" ]]; then
+    echo
+  fi
+  echo '===== vibe provision ====='
+  printf 'provisioned_at_utc: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf 'image: %s\n' "${VIBE_PROVISION_IMAGE:-unknown}"
+  printf 'base: %s\n' "${VIBE_PROVISION_BASE:-unknown}"
+  printf 'vibe_git_sha: %s\n' "${VIBE_GIT_SHA:-unknown}"
+  printf 'vibe_build_date: %s\n' "${VIBE_BUILD_DATE:-unknown}"
+  echo 'scripts:'
+  if [[ -n "${VIBE_PROVISION_SCRIPTS:-}" ]]; then
+    while IFS= read -r script; do
+      printf '  - %s\n' "${script}"
+    done <<<"${VIBE_PROVISION_SCRIPTS}"
+  fi
+} >>"${image_history}"
+
+if [[ "${base_first_run}" != true ]]; then
+  exit 0
+fi
 
 # Don't wait too long for slow mirrors.
 echo 'Acquire::http::Timeout "2";' | tee /etc/apt/apt.conf.d/99timeout
@@ -24,14 +53,8 @@ growpart /dev/vda 1
 # Expand filesystem
 resize2fs /dev/vda1
 
-# Set hostname to vibe" so it's clear that you're inside the VM.
+# Set hostname to "vibe" so it's clear that you're inside the VM.
 hostnamectl set-hostname vibe
-
-# Set this env var so claude doesn't complain about running as root.'
-echo "export IS_SANDBOX=1" >> .bashrc
-
-# Set this environment variable to prevent the Gemini CLI from failing to identify the sandbox command
-echo "export GEMINI_SANDBOX=false" >> .bashrc
 
 # Enable true color support in the terminal
 echo "export COLORTERM=truecolor" >> .bashrc
@@ -55,10 +78,6 @@ fi
 EOF
 
 
-# Install Rust
-curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --component "rustfmt,clippy"
-
-
 # Install Mise
 curl https://mise.run | sh
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
@@ -73,19 +92,12 @@ cat > .config/mise/config.toml <<MISE
     # Always use the venv created by uv, if available in directory
     python.uv_venv_auto = true
     experimental = true
-    idiomatic_version_file_enable_tools = ["rust"]
 
     [tools]
-    uv = "0.9.25"
-    node = "24.13.0"
-    "npm:@openai/codex" = "latest"
-    "npm:@anthropic-ai/claude-code" = "latest"
-    "npm:@google/gemini-cli" = "latest"
-    "npm:@earendil-works/pi-coding-agent" = "latest"
+    uv = "latest"
+    node = "latest"
+
 MISE
 
 touch .config/mise/mise.lock
 mise install
-
-# Done provisioning, power off the VM
-systemctl poweroff

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     env,
     ffi::OsString,
@@ -43,13 +44,20 @@ const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
-const PROVISION_SCRIPT: &str = include_str!("provision.sh");
+const SCRIPT_ACTION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const LOGIN_ACTION_INPUT_CHUNK_BYTES: usize = 256;
+const LOGIN_ACTION_INPUT_CHUNK_DELAY: Duration = Duration::from_millis(10);
+const PROVISION_SUCCESS_MARKER: &str = "VIBE_PROVISION_SUCCESS";
+const DEFAULT_IMAGE_NAME: &str = "default";
+const INSTANCE_DIR_NAME: &str = ".vibe";
+const INSTANCE_DISK_IMAGE_NAME: &str = "instance.raw";
+include!(concat!(env!("OUT_DIR"), "/provisioning.rs"));
 
 #[derive(Clone)]
 enum LoginAction {
     Expect { text: String, timeout: Duration },
     Send(String),
-    Script { path: PathBuf, index: usize },
+    Script { name: String, content: String },
 }
 use LoginAction::*;
 
@@ -117,6 +125,22 @@ impl DirectoryShare {
     }
 }
 
+fn provisioning_scripts_banner() -> String {
+    let mut scripts: Vec<String> = BUILTIN_PROVISION_SCRIPTS
+        .iter()
+        .filter(|s| s.name != "base")
+        .map(|s| format!("  @{:<10} {}", s.name, s.description))
+        .collect();
+    scripts.sort();
+
+    format!(
+        "Built-in provisioning scripts:
+
+{}",
+        scripts.join("\n")
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_cli()?;
 
@@ -130,55 +154,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.help {
-        println!(
-            "Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
+        println!("Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
-vibe [OPTIONS] [disk-image.raw]
+vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
+vibe provision [--base name-or-path] [--image name] [--replace] [@built-in | path/to/script.sh ...]
 
-Options
+Options:
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
+  --image NAME                                              Use this template image (ignored if `{INSTANCE_DIR_NAME}/{INSTANCE_DISK_IMAGE_NAME}` already exists)
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
-  --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
-                                                            Defaults to read-write.
-                                                            Errors if host-path does not exist.
-  --network [nat | vznat]                                   Guest networking mode (default `nat`).
+  --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
+                                                            Errors if HOST_PATH does not exist.
+  --network <nat|vznat>                                     Guest networking mode (default `nat`).
                                                             `nat` uses Vibe's bundled user-mode network stack.
-                                                            `vznat` uses Apple's VZNATNetworkDeviceAttachment fallback.
+                                                            `vznat` uses Apple's VZNATNetworkDeviceAttachment.
+  --cpus COUNT                                              Number of virtual CPUs (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
 
-  --cpus <count>                                            Number of virtual CPUs (default 2).
-  --ram <megabytes>                                         RAM size in megabytes (default 2048).
-  --script <path/to/script.sh>                              Run script in VM.
-  --send <some-command>                                     Type `some-command` followed by newline into the VM.
-  --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
-                                                            If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-");
+Login actions (executed in order after root login, repeatable):
+
+  --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
+  --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
+  --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
+                                                            If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
+
+Provisioning creates a new named image by running (built-in) scripts. Options:
+
+  --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
+  --image NAME                                              Name for new image (default `default`).
+  --replace                                                 Replace existing image with NAME, if one exists.
+
+{}",
+                 provisioning_scripts_banner()
+        );
         std::process::exit(0);
     }
-
-    ensure_signed();
-
-    let project_root = env::current_dir()?;
-    let project_name = project_root
-        .file_name()
-        .ok_or("Project directory has no name")?
-        .to_string_lossy()
-        .into_owned();
 
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME").map_or_else(|_| home.join(".cache"), PathBuf::from);
     let cache_dir = cache_home.join("vibe");
-
-    let usernet_helper_path = cache_dir.join("vibe-usernet");
-    let prepare_network_backend = || args.network_mode.prepare(&usernet_helper_path).unwrap();
-
     let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-
-    let instance_dir = project_root.join(".vibe");
-
     let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
     let base_compressed = cache_dir.join(basename_compressed);
     let base_raw = cache_dir.join(format!(
@@ -186,113 +205,173 @@ Options
         basename_compressed.trim_end_matches(".tar.xz")
     ));
 
-    let default_raw = cache_dir.join("default.raw");
-    let instance_raw = instance_dir.join("instance.raw");
-
     // Prepare system-wide directories
     fs::create_dir_all(&cache_dir)?;
     fs::create_dir_all(&guest_mise_cache)?;
 
+    ensure_signed();
+
+    let usernet_helper_path = cache_dir.join("vibe-usernet");
+    let prepare_network_backend = || args.network_mode.prepare(&usernet_helper_path).unwrap();
+
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
-    let disk_path = if let Some(path) = args.disk {
-        if !path.exists() {
-            return Err(format!("Disk image does not exist: {}", path.display()).into());
-        }
-        path
-    } else {
-        ensure_default_image(
-            &base_raw,
-            &base_compressed,
-            &default_raw,
-            std::slice::from_ref(&mise_directory_share),
-            prepare_network_backend,
-        )?;
-        ensure_instance_disk(&instance_raw, &default_raw)?;
-
-        instance_raw
-    };
-
-    let mut login_actions = Vec::new();
-    let mut directory_shares = Vec::new();
-
-    if !args.no_default_mounts {
-        login_actions.push(Send(format!(" cd {project_name}")));
-
-        // Discourage read/write of project dir subfolders within the VM.
-        // Note that this isn't secure, since the VM runs as root and could unmount this.
-        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-        for subfolder in [".git", ".vibe"] {
-            if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {subfolder}")));
+    match args.command {
+        CliCommand::Provision {
+            base,
+            image,
+            replace,
+            scripts,
+        } => {
+            let base_raw = match base {
+                Some(base) if base.contains('/') => PathBuf::from(base),
+                Some(base) => image_path(&cache_dir, &base),
+                None => {
+                    ensure_base_image(&base_raw, &base_compressed)?;
+                    base_raw
+                }
+            };
+            if !base_raw.exists() {
+                return Err(format!("Base image does not exist: {}", base_raw.display()).into());
             }
-        }
-
-        directory_shares.push(
-            DirectoryShare::new(
-                project_root,
-                PathBuf::from("/root/").join(project_name),
-                false,
+            provision_image(
+                &base_raw,
+                &image_path(&cache_dir, &image),
+                replace,
+                &scripts,
+                std::slice::from_ref(&mise_directory_share),
+                prepare_network_backend,
             )
-            .expect("Project directory must exist"),
-        );
-
-        directory_shares.push(mise_directory_share);
-
-        // Add default shares, if they exist
-        for share in [
-            DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
-            DirectoryShare::new(
-                home.join(".cargo/registry"),
-                "/root/.cargo/registry".into(),
-                false,
-            ),
-            DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-            DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
-            DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
-            DirectoryShare::new(home.join(".pi"), "/root/.pi".into(), false),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            directory_shares.push(share);
         }
-        // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
-        login_actions.push(Send(
-            " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
-                .to_string()
-        ));
+        CliCommand::Run { disk, image } => {
+            let project_root = env::current_dir()?;
+            let project_name = project_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+
+            let instance_dir = project_root.join(INSTANCE_DIR_NAME);
+            let instance_raw = instance_dir.join(INSTANCE_DISK_IMAGE_NAME);
+            let disk_path = if let Some(path) = disk {
+                if !path.exists() {
+                    return Err(format!("Disk image does not exist: {}", path.display()).into());
+                }
+                path.clone()
+            } else {
+                if image != DEFAULT_IMAGE_NAME && instance_raw.exists() {
+                    eprintln!("Ignoring --image {image}, using {}", instance_raw.display());
+                }
+                let template_raw = image_path(&cache_dir, &image);
+                if image == DEFAULT_IMAGE_NAME {
+                    ensure_default_image(
+                        &base_raw,
+                        &base_compressed,
+                        &template_raw,
+                        std::slice::from_ref(&mise_directory_share),
+                        prepare_network_backend,
+                    )?;
+                } else if !template_raw.exists() {
+                    return Err(format!(
+                        "Template image does not exist: {}",
+                        template_raw.display()
+                    )
+                    .into());
+                }
+                ensure_instance_disk(&instance_raw, &template_raw)?;
+
+                instance_raw
+            };
+
+            let mut login_actions = Vec::new();
+            let mut directory_shares = Vec::new();
+
+            if !args.no_default_mounts {
+                login_actions.push(Send(format!(" cd {project_name}")));
+
+                // Discourage read/write of project dir subfolders within the VM.
+                // Note that this isn't secure, since the VM runs as root and could unmount this.
+                // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
+                for subfolder in [".git", INSTANCE_DIR_NAME] {
+                    if project_root.join(subfolder).exists() {
+                        login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {subfolder}")));
+                    }
+                }
+
+                directory_shares.push(
+                    DirectoryShare::new(
+                        project_root,
+                        PathBuf::from("/root/").join(project_name),
+                        false,
+                    )
+                    .expect("Project directory must exist"),
+                );
+
+                directory_shares.push(mise_directory_share);
+                // Activate mise if applicable.
+                // This is in addition to the .bashrc, since mise activation must occur after the shared tool cache is mounted.
+                login_actions.push(Send(
+                    " if [ -x \"$HOME/.local/bin/mise\" ]; then eval \"$(\"$HOME/.local/bin/mise\" activate bash)\"; fi"
+                        .to_string(),
+                ));
+
+                // Add default shares, if they exist
+                for share in [
+                    DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+                    DirectoryShare::new(
+                        home.join(".cargo/registry"),
+                        "/root/.cargo/registry".into(),
+                        false,
+                    ),
+                    DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+                    DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
+                    DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
+                    DirectoryShare::new(home.join(".pi"), "/root/.pi".into(), false),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    directory_shares.push(share);
+                }
+                // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
+                login_actions.push(Send(
+                    " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
+                        .to_string()
+                ));
+            }
+
+            for spec in &args.mounts {
+                directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+            }
+
+            login_actions.extend(env_login_actions(&args.env));
+
+            // Enable bash history
+            login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
+
+            if let Some(motd_action) = motd_login_action(&directory_shares) {
+                login_actions.push(motd_action);
+            }
+
+            // Any user-provided login actions must come after our system ones
+            login_actions.extend(args.login_actions);
+
+            run_vm(
+                &disk_path,
+                &login_actions,
+                &directory_shares[..],
+                prepare_network_backend,
+                args.cpu_count,
+                args.ram_bytes,
+            )
+            .map(|_| ())
+        }
     }
-
-    for spec in &args.mounts {
-        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
-    }
-
-    login_actions.extend(env_login_actions(&args.env));
-
-    // Enable bash history
-    login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
-
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
-        login_actions.push(motd_action);
-    }
-
-    // Any user-provided login actions must come after our system ones
-    login_actions.extend(args.login_actions);
-
-    run_vm(
-        &disk_path,
-        &login_actions,
-        &directory_shares[..],
-        prepare_network_backend,
-        args.cpu_count,
-        args.ram_bytes,
-    )
 }
 
 struct CliArgs {
-    disk: Option<PathBuf>,
+    command: CliCommand,
     version: bool,
     help: bool,
     no_default_mounts: bool,
@@ -304,6 +383,19 @@ struct CliArgs {
     ram_bytes: u64,
 }
 
+enum CliCommand {
+    Run {
+        disk: Option<PathBuf>,
+        image: String,
+    },
+    Provision {
+        base: Option<String>,
+        image: String,
+        replace: bool,
+        scripts: Vec<ProvisionScript>,
+    },
+}
+
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     fn os_to_string(value: OsString, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
         value
@@ -311,8 +403,74 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             .map_err(|_| format!("{flag} expects valid UTF-8").into())
     }
 
+    fn parse_provision_command(
+        parser: &mut lexopt::Parser,
+    ) -> Result<CliCommand, Box<dyn std::error::Error>> {
+        let mut base = None;
+        let mut image = DEFAULT_IMAGE_NAME.to_string();
+        let mut image_seen = false;
+        let mut replace = false;
+        let mut scripts = Vec::new();
+
+        while let Some(arg) = parser.next()? {
+            match arg {
+                Long("base") => {
+                    if base.is_some() {
+                        return Err("Duplicate --base".into());
+                    }
+                    base = Some(os_to_string(parser.value()?, "--base")?);
+                }
+                Long("image") => {
+                    if image_seen {
+                        return Err("Duplicate --image".into());
+                    }
+                    image_seen = true;
+                    image = os_to_string(parser.value()?, "--image")?;
+                    assert_valid_image_name(&image);
+                }
+                Long("replace") => replace = true,
+                Value(value) => {
+                    let name = os_to_string(value, "provisioning script")?;
+                    let script = if let Some(name) = name.strip_prefix('@') {
+                        BUILTIN_PROVISION_SCRIPTS
+                            .iter()
+                            .find(|script| script.name == name)
+                            .cloned()
+                            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                                format!(
+                                    "Unknown built-in provisioning script: @{name}\n\n{}",
+                                    provisioning_scripts_banner()
+                                )
+                                .into()
+                            })?
+                    } else {
+                        ProvisionScript {
+                            content: Cow::Owned(fs::read_to_string(&name).map_err(|err| {
+                                format!("Failed to read provisioning script {name}: {err}")
+                            })?),
+                            name: Cow::Owned(name),
+                            description: Cow::Borrowed(""),
+                        }
+                    };
+                    scripts.push(script);
+                }
+                _ => return Err(arg.unexpected().into()),
+            }
+        }
+
+        Ok(CliCommand::Provision {
+            base,
+            image,
+            replace,
+            scripts,
+        })
+    }
+
     let mut parser = lexopt::Parser::from_env();
     let mut disk = None;
+    let mut command = None;
+    let mut image = DEFAULT_IMAGE_NAME.to_string();
+    let mut image_seen = false;
     let mut version = false;
     let mut help = false;
     let mut no_default_mounts = false;
@@ -320,7 +478,6 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
     let mut network_mode = NetworkMode::Nat;
-    let mut script_index = 0;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
 
@@ -328,6 +485,14 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         match arg {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
+            Long("image") => {
+                if image_seen {
+                    return Err("Duplicate --image".into());
+                }
+                image_seen = true;
+                image = os_to_string(parser.value()?, "--image")?;
+                assert_valid_image_name(&image);
+            }
             Long("no-default-mounts") => no_default_mounts = true,
             Long("env") => {
                 let name = os_to_string(parser.value()?, "--env")?;
@@ -366,11 +531,13 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 network_mode = NetworkMode::parse(&value)?;
             }
             Long("script") => {
+                let path = os_to_string(parser.value()?, "--script")?;
+                let content = fs::read_to_string(&path)
+                    .map_err(|err| format!("Failed to read script {path}: {err}"))?;
                 login_actions.push(Script {
-                    path: os_to_string(parser.value()?, "--script")?.into(),
-                    index: script_index,
+                    name: path,
+                    content,
                 });
-                script_index += 1;
             }
             Long("send") => {
                 login_actions.push(Send(os_to_string(parser.value()?, "--send")?));
@@ -384,6 +551,11 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 login_actions.push(Expect { text, timeout });
             }
             Value(value) => {
+                let value = os_to_string(value, "argument")?;
+                if disk.is_none() && command.is_none() && value == "provision" {
+                    command = Some(parse_provision_command(&mut parser)?);
+                    break;
+                }
                 if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
                 }
@@ -394,7 +566,10 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     }
 
     Ok(CliArgs {
-        disk,
+        command: match command {
+            Some(command) => command,
+            None => CliCommand::Run { disk, image },
+        },
         version,
         help,
         no_default_mounts,
@@ -410,36 +585,56 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
 fn env_login_actions(env: &HashMap<String, String>) -> Vec<LoginAction> {
     env.iter()
         //leading space to keep env out of bash history; escape single quotes in value
-        .map(|(name, value)| Send(format!(" export {name}='{}'", value.replace('\'', r"'\''"))))
+        .map(|(name, value)| Send(format!(" export {name}='{}'", shell_single_quote(value))))
         .collect()
 }
 
-fn script_command_from_path(
-    path: &Path,
-    index: usize,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let script = fs::read_to_string(path)
-        .map_err(|err| format!("Failed to read script {}: {err}", path.display()))?;
-    let label = format!("{}_{}", index, path.file_name().unwrap().display());
-    script_command_from_content(&label, &script)
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', r"'\''")
 }
 
-fn script_command_from_content(
-    label: &str,
-    script: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn script_command_and_status_marker(id: &str, script: &str) -> (String, String) {
     let marker = "VIBE_SCRIPT_EOF";
     let guest_dir = "/tmp/vibe-scripts";
-    let guest_path = format!("{guest_dir}/{label}.sh");
+    let guest_path = format!("{guest_dir}/{id}.sh");
+    let status_marker = format!("VIBE_SCRIPT_STATUS_{id}");
+
+    // Run the script with stdin from /dev/null so long-running tools spawned by
+    // the script cannot consume queued wrapper lines before the parent shell
+    // sees them. Print a leading newline before the marker so terminal echo and
+    // control sequences cannot merge the echoed printf command with the marker
+    // line that wait_for_line_after expects. Reactivate mise after each
+    // successful script so later scripts can use newly installed commands.
     let command = format!(
-        " mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n {guest_path}"
+        " mkdir -p {guest_dir}\n\
+cat >{guest_path} <<'{marker}'\n\
+{script}\n\
+{marker}\n\
+chmod +x {guest_path}\n\
+{guest_path} </dev/null\n\
+status=$?\n\
+if [ \"$status\" -eq 0 ] && [ -x \"$HOME/.local/bin/mise\" ]; then\n\
+eval \"$(\"$HOME/.local/bin/mise\" activate bash)\"\n\
+fi\n\
+printf '\\n%s\\n%s\\n' '{status_marker}' \"$status\""
     );
-    if script.contains(marker) {
-        return Err(
-            format!("Script '{label}' contains marker '{marker}', cannot safely upload").into(),
-        );
-    }
-    Ok(command)
+
+    (command, status_marker)
+}
+
+fn assert_valid_image_name(name: &str) {
+    assert!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c == '-' || c == '_' || c.is_ascii_alphanumeric()),
+        "Image name must be alphanumeric, dash, or underscore."
+    );
+}
+
+fn image_path(cache_dir: &Path, name: &str) -> PathBuf {
+    assert_valid_image_name(name);
+    cache_dir.join(format!("{name}.raw"))
 }
 
 fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
@@ -506,12 +701,6 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
     Some(Send(command))
 }
 
-#[derive(PartialEq, Eq)]
-enum WaitResult {
-    Timeout,
-    Found,
-}
-
 pub enum VmInput {
     Bytes(Vec<u8>),
     Shutdown,
@@ -519,6 +708,7 @@ pub enum VmInput {
 
 enum VmOutput {
     LoginActionTimeout { action: String, timeout: Duration },
+    LoginActionFailed { action: String, status: u8 },
 }
 
 #[derive(Default)]
@@ -536,12 +726,14 @@ impl OutputMonitor {
         self.condvar.notify_all();
     }
 
-    fn wait_for(&self, needle: &str, timeout: Duration) -> WaitResult {
-        let (_unused, timeout_result) = self
+    fn wait_for_text(&self, needle: &str, timeout: Duration) -> bool {
+        let mut found = false;
+        let (_unused, _timeout_result) = self
             .condvar
             .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
                 if let Some((_, remaining)) = buf.split_once(needle) {
                     *buf = remaining.to_string();
+                    found = true;
                     false
                 } else {
                     true
@@ -549,11 +741,43 @@ impl OutputMonitor {
             })
             .unwrap();
 
-        if timeout_result.timed_out() {
-            WaitResult::Timeout
-        } else {
-            WaitResult::Found
-        }
+        found
+    }
+
+    fn wait_for_line_after(&self, marker: &str, timeout: Duration) -> Option<String> {
+        let mut line = None;
+        let (_unused, _timeout_result) = self
+            .condvar
+            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
+                let mut line_start = 0;
+                let mut marker_seen = false;
+
+                while let Some(line_end_offset) = buf[line_start..].find('\n') {
+                    let line_end = line_start + line_end_offset;
+                    let current_line = buf[line_start..line_end]
+                        .strip_suffix('\r')
+                        .unwrap_or(&buf[line_start..line_end]);
+
+                    if marker_seen {
+                        line = Some(current_line.to_string());
+                        let remaining = buf[line_end + 1..].to_string();
+                        *buf = remaining;
+                        return false;
+                    }
+
+                    marker_seen = current_line == marker;
+                    line_start = line_end + 1;
+                }
+
+                true
+            })
+            .unwrap();
+
+        line
+    }
+
+    fn snapshot(&self) -> String {
+        self.buffer.lock().unwrap().clone()
     }
 }
 
@@ -635,26 +859,133 @@ fn ensure_default_image(
 
     ensure_base_image(base_raw, base_compressed)?;
 
-    println!("Configuring base image...");
-    fs::copy(base_raw, default_raw)?;
+    // Provision with everything, so folks who don't read README have a "it just works" experience.
+    let default_provisioning_scripts: Vec<_> = BUILTIN_PROVISION_SCRIPTS
+        .iter()
+        .filter(|s| s.name != "base")
+        .cloned()
+        .collect();
 
-    fs::OpenOptions::new()
-        .write(true)
-        .open(default_raw)?
-        // resize to 20GiB
-        .set_len(20 * 1024 * BYTES_PER_MB)?;
+    println!("Provisioning default VM with:");
+    for s in &default_provisioning_scripts {
+        println!("  @{}", &s.name);
+    }
+    println!("If you want a lighter default image, see `vibe provision`");
 
-    let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
-    run_vm(
+    provision_image(
+        base_raw,
         default_raw,
-        &[Send(provision_command)],
+        false,
+        &default_provisioning_scripts[..],
         directory_shares,
         prepare_network_backend,
-        DEFAULT_CPU_COUNT,
-        DEFAULT_RAM_BYTES,
-    )?;
+    )
+}
 
-    Ok(())
+fn provision_image(
+    base_raw: &Path,
+    image_raw: &Path,
+    replace: bool,
+    extra_scripts: &[ProvisionScript],
+    directory_shares: &[DirectoryShare],
+    prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let image_name = image_raw
+        .file_stem()
+        .expect("image path has a file name")
+        .to_string_lossy();
+    if image_raw.exists() && !replace {
+        return Err(format!(
+            "Image '{image_name}' already exists at {}; pass --replace to overwrite it",
+            image_raw.display()
+        )
+        .into());
+    }
+
+    let image_dir = image_raw
+        .parent()
+        .expect("image path has a parent directory");
+    fs::create_dir_all(image_dir)?;
+
+    let tmp_raw = image_dir.join(format!("{image_name}.tmp.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp_raw);
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        println!("Provisioning image '{image_name}'");
+
+        fs::copy(base_raw, &tmp_raw)?;
+
+        let desired_size = 20 * 1024 * BYTES_PER_MB;
+        let current_size = fs::metadata(&tmp_raw)?.len();
+        if current_size < desired_size {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp_raw)?
+                .set_len(desired_size)?;
+        }
+
+        let scripts: Vec<&ProvisionScript> = std::iter::once(
+            BUILTIN_PROVISION_SCRIPTS
+                .iter()
+                .find(|script| script.name == "base")
+                .expect("base provisioning script is bundled"),
+        )
+        .chain(extra_scripts.iter())
+        .collect();
+
+        let mut login_actions = Vec::new();
+
+        let script_names = scripts
+            .iter()
+            .map(|script| script.name.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        login_actions.push(Send(format!(
+            " export VIBE_PROVISION_IMAGE='{}'\n\
+export VIBE_PROVISION_BASE='{}'\n\
+export VIBE_GIT_SHA='{}'\n\
+export VIBE_BUILD_DATE='{}'\n\
+export VIBE_PROVISION_SCRIPTS='{}'",
+            shell_single_quote(&image_name),
+            shell_single_quote(&base_raw.to_string_lossy()),
+            env!("GIT_SHA"),
+            env!("BUILD_DATE"),
+            shell_single_quote(&script_names)
+        )));
+
+        for script in scripts {
+            login_actions.push(Script {
+                name: script.name.to_string(),
+                content: script.content.to_string(),
+            });
+        }
+
+        login_actions.push(Send(format!(" echo {PROVISION_SUCCESS_MARKER}")));
+        login_actions.push(Expect {
+            text: PROVISION_SUCCESS_MARKER.to_string(),
+            timeout: DEFAULT_EXPECT_TIMEOUT,
+        });
+        login_actions.push(Send(" systemctl poweroff; sleep 100".to_string()));
+
+        run_vm(
+            &tmp_raw,
+            &login_actions,
+            directory_shares,
+            prepare_network_backend,
+            DEFAULT_CPU_COUNT,
+            DEFAULT_RAM_BYTES,
+        )?;
+
+        fs::rename(&tmp_raw, image_raw)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_raw);
+    }
+
+    result
 }
 
 fn ensure_instance_disk(
@@ -1077,11 +1408,23 @@ fn spawn_login_actions_thread(
     input_tx: mpsc::Sender<VmInput>,
     vm_output_tx: mpsc::Sender<VmOutput>,
 ) -> thread::JoinHandle<()> {
+    fn send_text(input_tx: &mpsc::Sender<VmInput>, mut text: String) {
+        // Type the newline so the command is actually submitted.
+        text.push('\n');
+        // Send text to VM in chunks so that we don't overrun its input buffer.
+        for chunk in text.as_bytes().chunks(LOGIN_ACTION_INPUT_CHUNK_BYTES) {
+            input_tx
+                .send(VmInput::Bytes(chunk.to_vec()))
+                .expect("failed to send login action to VM input thread");
+            thread::sleep(LOGIN_ACTION_INPUT_CHUNK_DELAY);
+        }
+    }
+
     thread::spawn(move || {
-        for a in login_actions {
+        for (index, a) in login_actions.into_iter().enumerate() {
             match a {
                 Expect { text, timeout } => {
-                    if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
+                    if !output_monitor.wait_for_text(&text, timeout) {
                         let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
                             action: format!("expect '{text}'"),
                             timeout,
@@ -1089,21 +1432,33 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                Send(mut text) => {
-                    text.push('\n'); // Type the newline so the command is actually submitted.
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                Send(text) => {
+                    send_text(&input_tx, text);
                 }
-                Script { path, index } => {
-                    let command = match script_command_from_path(&path, index) {
-                        Ok(command) => command,
-                        Err(err) => {
-                            eprintln!("{err}");
+                Script { name, content } => {
+                    let id = format!("script_{index}");
+                    let (command, status_marker) = script_command_and_status_marker(&id, &content);
+                    send_text(&input_tx, command);
+                    match output_monitor.wait_for_line_after(&status_marker, SCRIPT_ACTION_TIMEOUT)
+                    {
+                        None => {
+                            let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
+                                action: format!("script '{name}'"),
+                                timeout: SCRIPT_ACTION_TIMEOUT,
+                            });
                             return;
                         }
-                    };
-                    let mut text = command;
-                    text.push('\n');
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                        Some(status) => {
+                            let status = status.trim().parse().unwrap_or(u8::MAX);
+                            if status != 0 {
+                                let _ = vm_output_tx.send(VmOutput::LoginActionFailed {
+                                    action: format!("script '{name}'"),
+                                    status,
+                                });
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1117,7 +1472,7 @@ fn run_vm(
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();
@@ -1240,6 +1595,16 @@ fn run_vm(
 
     let mut last_state = None;
     let mut exit_result = Ok(());
+    let request_stop = || unsafe {
+        if vm.canRequestStop() {
+            if let Err(err) = vm.requestStopWithError() {
+                eprintln!("Failed to request VM stop: {err:?}");
+            }
+        } else if vm.canStop() {
+            let handler = RcBlock::new(|_error: *mut NSError| {});
+            vm.stopWithCompletionHandler(&handler);
+        }
+    };
     loop {
         unsafe {
             NSRunLoop::mainRunLoop().runMode_beforeDate(
@@ -1257,18 +1622,15 @@ fn run_vm(
             Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
                 exit_result = Err(format!(
                     "Login action ({action}) timed out after {timeout:?}; shutting down."
-                )
-                .into());
-                unsafe {
-                    if vm.canRequestStop() {
-                        if let Err(err) = vm.requestStopWithError() {
-                            eprintln!("Failed to request VM stop: {err:?}");
-                        }
-                    } else if vm.canStop() {
-                        let handler = RcBlock::new(|_error: *mut NSError| {});
-                        vm.stopWithCompletionHandler(&handler);
-                    }
-                }
+                ));
+                request_stop();
+                break;
+            }
+            Ok(VmOutput::LoginActionFailed { action, status }) => {
+                exit_result = Err(format!(
+                    "Login action ({action}) failed with exit code {status}"
+                ));
+                request_stop();
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -1284,7 +1646,9 @@ fn run_vm(
 
     io_ctx.shutdown();
 
-    exit_result
+    let output = output_monitor.snapshot();
+    exit_result?;
+    Ok(output)
 }
 
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {

@@ -51,7 +51,7 @@ I'm using virtual machines rather than containers because:
 Finally, as a matter of taste and style:
 
 - I wrote the entire README myself, 100% with my human brain.
-- The entire implementation is ~1500 lines of Rust.
+- The entire implementation is ~2000 lines of Rust.
 - The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [lexopt](https://github.com/blyxxyz/lexopt) argument parser.
 - There are no emoji anywhere in this repository.
 
@@ -83,48 +83,68 @@ If you're building from a checkout, use mise to get the Rust and Go compilers:
 
 ## Using Vibe
 
-```
-vibe [OPTIONS] [disk-image.raw]
+Vibe only does two things:
 
-Options
+1. **Runs** VMs from a raw disk image file
+2. **Provisions** VMs by booting a base raw disk image, running scripts in it, then saving the resulting raw disk image as a template
 
-  --help                                                    Print this help message.
-  --version                                                 Print the version (commit SHA and build date).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
-  --env NAME                                                Export host environment variable NAME inside VM.
-                                                            Errors if NAME is unset or empty.
-  --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
-                                                            Defaults to read-write.
-                                                            Errors if host-path does not exist.
-  --network [nat | vznat]                                   Guest networking mode (default `nat`).
-                                                            `nat` uses Vibe's bundled user-mode network stack.
-                                                            `vznat` uses Apple's VZNATNetworkDeviceAttachment.
-
-  --cpus <count>                                            Number of virtual CPUs (default 2).
-  --ram <megabytes>                                         RAM size in megabytes (default 2048).
-  --script <path/to/script.sh>                              Run script in VM.
-  --send <some-command>                                     Type `some-command` followed by newline into the VM.
-  --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
-                                                            If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-```
-
-Invoking vibe without a disk image:
-
-- shares the current directory with the VM
-- shares package manager cache directories with the VM, so that packages are not re-downloaded
-- shares the `~/.codex` directory with the VM, so you can use OpenAI's [codex](https://openai.com/codex/)
-- shares the `~/.claude` directory with the VM, so you can use Anthropic's [claude](https://claude.com/product/claude-code)
-- shares the `~/.gemini` directory with the VM, so you can use Google's [gemini-cli](https://github.com/google-gemini/gemini-cli)
-- shares the `~/.pi` directory with the VM, so you can use the [Pi agent harness](https://pi.dev/)
-
-The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, rust, etc., and saved as `default.raw`.
-(See [provision.sh](/src/provision.sh) for details.)
-
-Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
+When you run `vibe` in a project directory, it copies the default template (`~/.cache/vibe/default.raw`) to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
 
 When you `exit` this shell, the VM is shutdown.
 The disk state persists until you delete it.
-There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
+
+Where does this `default.raw` raw disk image come from?
+
+When you first run `vibe`, a Debian Linux base image is downloaded and [all of the provisioning scripts](/provisioning/) are run against it.
+
+As a thoughtful person who reads the README, you'll probably appreciate the ability to create custom template images by running:
+
+    vibe provision --image my-template @rust @codex my-custom-script.sh
+
+(Omitting `--image` provisions the default template.)
+Scripts are run in order, and those prefixed with `@` are resolved against the built-in scripts shipped with Vibe.
+
+In `my-custom-script.sh` I set up my tmux keybindings, favorite shell customizations, etc.
+
+In a project directory, you can then run `vibe --image my-template` to use this template image (this flag is ignored if `.vibe/instance.raw` already exists).
+
+The [base provisioning script](/provisioning/base.sh) is always run when provisioning to install basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc.
+If you don't want this, you can make your own `.raw` disk images and copy them into `~/.cache/vibe/` to use them as templates.
+
+
+```
+vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
+vibe provision [--base name-or-path] [--image name] [--replace] [@built-in | path/to/script.sh ...]
+
+Options:
+
+  --help                                                    Print this help message.
+  --version                                                 Print the version (commit SHA and build date).
+  --image NAME                                              Use this template image (ignored if `.vibe/instance.raw` already exists)
+  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --env NAME                                                Export host environment variable NAME inside VM.
+                                                            Errors if NAME is unset or empty.
+  --mount HOST_PATH:GUEST_PATH[:read-only | :read-write]    Mount HOST_PATH inside VM at GUEST_PATH (default mode `:read-write`)
+                                                            Errors if HOST_PATH does not exist.
+  --network <nat|vznat>                                     Guest networking mode (default `nat`).
+                                                            `nat` uses Vibe's bundled user-mode network stack.
+                                                            `vznat` uses Apple's VZNATNetworkDeviceAttachment.
+  --cpus COUNT                                              Number of virtual CPUs (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
+
+Login actions (executed in order after root login, repeatable):
+
+  --script PATH_TO_SCRIPT                                   Run script in VM; stop if it exits non-zero.
+  --send SOME_COMMAND                                       Type SOME_COMMAND followed by newline into the VM.
+  --expect STRING [timeout-seconds]                         Wait for STRING to appear in console output before executing next login action.
+                                                            If STRING does not appear within timeout (default 30 seconds), shutdown VM with error.
+
+Provisioning creates a new named image by running (built-in) scripts. Options:
+
+  --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
+  --image NAME                                              Name for new image (default `default`).
+  --replace                                                 Replace existing image with NAME, if one exists.
+```
 
 ## Other notes
 
@@ -160,6 +180,7 @@ There is no centralized registry of VMs --- if you want to delete a VM, just del
 
         vibe --send "ln -fs ~/.claude/dot_claude_dot_json_should_have_been_here.json ~/.claude.json" \
              --send "IS_SANDBOX=1 claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"
+
 
 ## Alternatives
 

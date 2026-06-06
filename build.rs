@@ -53,6 +53,48 @@ fn main() {
         );
     }
 
+    {
+        let provisioning_dir = manifest_dir.join("provisioning");
+        println!("cargo:rerun-if-changed={}", provisioning_dir.display());
+        let scripts = fs::read_dir(&provisioning_dir)
+            .expect("read provisioning dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("sh"));
+
+        let mut generated = String::from(
+            r#"
+#[derive(Clone)]
+struct ProvisionScript {
+    name: std::borrow::Cow<'static, str>,
+    description: std::borrow::Cow<'static, str>,
+    content: std::borrow::Cow<'static, str>,
+}
+
+const BUILTIN_PROVISION_SCRIPTS: &[ProvisionScript] = &[
+"#,
+        );
+        for path in scripts {
+            println!("cargo:rerun-if-changed={}", path.display());
+            let name = path.file_stem().unwrap();
+            let content = fs::read_to_string(&path).expect("read provisioning script");
+            let description = content
+                .lines()
+                .nth(1)
+                .map(|line| line.trim_start_matches('#').trim())
+                .unwrap_or("")
+                .to_string();
+            generated.push_str(&format!(
+                "    ProvisionScript {{ name: std::borrow::Cow::Borrowed({:?}), description: std::borrow::Cow::Borrowed({:?}), content: std::borrow::Cow::Borrowed(include_str!({:?})) }},\n",
+                name,
+                description,
+                path.display(),
+            ));
+        }
+        generated.push_str("];");
+        fs::write(out_dir.join("provisioning.rs"), generated).expect("write provisioning.rs");
+    }
+
     // Expose GIT_SHA and BUILD_DATE vars so Vibe can embed them in its version info
     {
         let sha = Command::new("git")

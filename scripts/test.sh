@@ -29,7 +29,7 @@ run_go() {
   done < <(gofmt -l "${go_files[@]}")
 
   if [[ ${#unformatted_go_files[@]} -gt 0 ]]; then
-    printf 'error: gofmt needed for:\n' >&2
+    echo 'error: gofmt needed for:' >&2
     printf '  %s\n' "${unformatted_go_files[@]}" >&2
     exit 1
   fi
