@@ -214,7 +214,11 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
     ensure_signed();
 
     let usernet_helper_path = cache_dir.join("vibe-usernet");
-    let prepare_network_backend = || args.network_mode.prepare(&usernet_helper_path).unwrap();
+    let prepare_network_backend = |log_dir: Option<&Path>| {
+        args.network_mode
+            .prepare(&usernet_helper_path, log_dir)
+            .unwrap()
+    };
 
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
@@ -260,6 +264,9 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 
             let instance_dir = project_root.join(INSTANCE_DIR_NAME);
             let instance_raw = instance_dir.join(INSTANCE_DISK_IMAGE_NAME);
+            // Only persist the networking log for the managed instance disk in `.vibe/`.
+            // For external `--disk` there's no natural per-instance directory to write to, so skip logging.
+            let log_to_instance = disk.is_none();
             let disk_path = if let Some(path) = disk {
                 if !path.exists() {
                     return Err(format!("Disk image does not exist: {}", path.display()).into());
@@ -365,6 +372,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 
             run_vm(
                 &disk_path,
+                log_to_instance.then_some(instance_dir.as_path()),
                 &login_actions,
                 &directory_shares[..],
                 prepare_network_backend,
@@ -873,7 +881,7 @@ fn ensure_default_image(
     base_compressed: &Path,
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
-    prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+    prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if default_raw.exists() {
         return Ok(());
@@ -913,7 +921,7 @@ fn provision_image(
     replace: bool,
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
-    prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+    prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -997,6 +1005,7 @@ export VIBE_PROVISION_SCRIPTS='{}'",
 
         run_vm(
             &tmp_raw,
+            None,
             &login_actions,
             directory_shares,
             prepare_network_backend,
@@ -1494,16 +1503,17 @@ fn spawn_login_actions_thread(
 
 fn run_vm(
     disk_path: &Path,
+    network_log_dir: Option<&Path>,
     login_actions: &[LoginAction],
     directory_shares: &[DirectoryShare],
-    prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+    prepare_network_backend: impl Fn(Option<&Path>) -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();
-    let mut prepared_network_backend = prepare_network_backend();
+    let mut prepared_network_backend = prepare_network_backend(network_log_dir);
     let config = create_vm_configuration(
         disk_path,
         directory_shares,

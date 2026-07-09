@@ -51,6 +51,7 @@ impl NetworkMode {
     pub fn prepare(
         &self,
         usernet_helper_path: &Path,
+        log_path: Option<&Path>,
     ) -> Result<PreparedNetworkBackend, Box<dyn std::error::Error>> {
         match self {
             NetworkMode::VzNat => Ok(PreparedNetworkBackend::VzNat),
@@ -97,7 +98,7 @@ impl NetworkMode {
                 let mut helper = UsernetHelperProcess {
                     child: command.spawn()?,
                 };
-                helper.wait_until_ready()?;
+                helper.wait_until_ready(log_path)?;
 
                 Ok(PreparedNetworkBackend::Usernet {
                     vm_socket_fd: Some(vm_socket_fd),
@@ -154,7 +155,10 @@ pub struct UsernetHelperProcess {
 }
 
 impl UsernetHelperProcess {
-    fn wait_until_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn wait_until_ready(
+        &mut self,
+        log_path: Option<&Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let stdout = self
             .child
             .stdout
@@ -201,7 +205,24 @@ impl UsernetHelperProcess {
             return Err(format!("vibe-usernet sent unexpected ready line: {line:?}").into());
         }
 
-        drop(reader);
+        // Drain vibe-usernet's stdout/stderr so OS pipe buffers don't fill up and block the helper.
+        // Log stderr to a path, if one was provided.
+        let mut stderr_sink = log_path
+            .and_then(|dir| {
+                fs::create_dir_all(dir).ok()?;
+                fs::File::create(dir.join("vibe-usernet.log")).ok()
+            })
+            .map(|file| Box::new(file) as Box<dyn io::Write + Send>)
+            .unwrap_or_else(|| Box::new(io::sink()));
+
+        std::thread::spawn(move || {
+            let _ = io::copy(&mut reader, &mut io::sink());
+        });
+        if let Some(mut stderr) = self.child.stderr.take() {
+            std::thread::spawn(move || {
+                let _ = io::copy(&mut stderr, &mut stderr_sink);
+            });
+        }
 
         Ok(())
     }
