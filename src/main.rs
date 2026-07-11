@@ -41,6 +41,7 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
+const DEFAULT_DISK_GB: u64 = 100;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -950,7 +951,7 @@ fn provision_image(
 
         fs::copy(base_raw, &tmp_raw)?;
 
-        let desired_size = 20 * 1024 * BYTES_PER_MB;
+        let desired_size = DEFAULT_DISK_GB * 1024 * BYTES_PER_MB;
         let current_size = fs::metadata(&tmp_raw)?.len();
         if current_size < desired_size {
             fs::OpenOptions::new()

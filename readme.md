@@ -150,21 +150,24 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
 
 ## Other notes
 
-- Apple's [VZNATNetworkDeviceAttachment](https://developer.apple.com/documentation/virtualization/vznatnetworkdeviceattachment) loses packets and VMs get wrecked whenever host networking changes (e.g., switching between wifi/ethernet/VPN) and [VZBridgedNetworkDeviceAttachment](https://developer.apple.com/documentation/virtualization/vzbridgednetworkdeviceattachment) requires kowtowing to acquire the restricted [com.apple.vm.networking](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.vm.networking) entitlement.
-  To achieve reliable networking, Vibe bundles a gVisor/Lima-style user-mode network stack and runs it automatically for your VMs.
-  The guest is at `192.168.5.15`, the gateway at `192.168.5.2`, and DNS is handled by the host resolver so you get VPN and split-DNS compatibility.
-  
-- The default VM disk is 20 GiB, but only uses about 2.5 GiB.
-  Since Apple Filesystem is copy-on-write and doesn't count zeros, disk space is only used when you actually write new blocks.
+- Vibe VMs can reach the host at `192.168.5.2`.
+  The host cannot reach the Vibe VMs, nor can VMs reach each other.
+  DNS is handled by the host resolver, so VMs get VPN and split-DNS compatibility.
+
+- This networking is based on a bundled gVisor/Lima-style user-mode network helper process, `vibe-usernet`, which is spawned automatically when you run `vibe`.
+  I ended up with this solution because Apple's [VZNATNetworkDeviceAttachment](https://developer.apple.com/documentation/virtualization/vznatnetworkdeviceattachment) lost packets and VMs got wrecked whenever host networking changed (e.g., switching between wifi/ethernet/VPN). [VZBridgedNetworkDeviceAttachment](https://developer.apple.com/documentation/virtualization/vzbridgednetworkdeviceattachment) requires kowtowing to acquire the restricted [com.apple.vm.networking](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.vm.networking) entitlement, which I'm not interested in doing.
+  If you have suggestions for how to improve networking capabilities, please open an issue or PR!
+
+- The default VM disk is 100 GiB, but since Apple Filesystem is copy-on-write and doesn't count zeros, disk space is only used when you actually write new blocks.
   You can use `du -h` to see how much space is actually consumed:
-      
+
       $ ls -lah .vibe/instance.raw
-      -rw-r--r--  1 dev  staff    20G Feb 11 21:57 .vibe/instance.raw
+      -rw-r--r--  1 dev  staff    100G Feb 11 21:57 .vibe/instance.raw
 
       $ du -h .vibe/instance.raw
       2.5G    .vibe/instance.raw
 
-  If you need even more space within the VM, e.g., 100 GiB, run `truncate -s 100G .vibe/instance.raw` on your Mac and then within the VM run `growpart /dev/vda 1 && resize2fs /dev/vda1`.
+  If you need even more space within the VM, e.g., 500 GiB, run `truncate -s 500G .vibe/instance.raw` on your Mac and then within the VM run `growpart /dev/vda 1 && resize2fs /dev/vda1`.
 
 - MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
 
